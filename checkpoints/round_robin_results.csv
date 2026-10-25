@@ -1,0 +1,11 @@
+model,label,matches,wins,losses,win_rate,points_for,points_against,diff
+dqn_ALE_Pong-v5_step_2200000.pt,step_2200000,18,12,6,66.66666666666666,67,43,24
+best_model.pt,best_model,18,12,6,66.66666666666666,66,50,16
+dqn_ALE_Pong-v5_step_10000000.pt,step_10000000,18,10,8,55.55555555555556,63,49,14
+dqn_ALE_Pong-v5_step_1450000.pt,step_1450000,18,10,8,55.55555555555556,59,50,9
+dqn_ALE_Pong-v5_step_1350000.pt,step_1350000,18,9,9,50.0,65,61,4
+dqn_ALE_Pong-v5_step_2350000.pt,step_2350000,18,9,9,50.0,58,56,2
+dqn_ALE_Pong-v5_step_9700000.pt,step_9700000,18,8,10,44.44444444444444,50,61,-11
+dqn_ALE_Pong-v5_step_4600000.pt,step_4600000,18,8,10,44.44444444444444,50,62,-12
+dqn_ALE_Pong-v5_step_3900000.pt,step_3900000,18,6,12,33.33333333333333,43,65,-22
+dqn_ALE_Pong-v5_step_5100000.pt,step_5100000,18,6,12,33.33333333333333,44,68,-24

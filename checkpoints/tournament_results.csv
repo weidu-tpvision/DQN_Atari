@@ -1,0 +1,11 @@
+model,path,win_rate,wins,matches,mean_net_score,std_net_score,min_net_score,max_net_score,avg_agent_pts,avg_cpu_conceded,shutouts,avg_steps
+dqn_ALE_Pong-v5_step_10000000.pt,checkpoints/dqn_ALE_Pong-v5_step_10000000.pt,100.0,5,5,19.2,1.1661903789690602,18,21,21.0,1.8,5,1944.0
+dqn_ALE_Pong-v5_step_9700000.pt,checkpoints/dqn_ALE_Pong-v5_step_9700000.pt,100.0,5,5,19.0,1.4142135623730951,17,21,21.0,2.0,4,1960.2
+dqn_ALE_Pong-v5_step_4600000.pt,checkpoints/dqn_ALE_Pong-v5_step_4600000.pt,100.0,5,5,18.4,1.3564659966250536,16,20,21.0,2.6,4,2007.4
+dqn_ALE_Pong-v5_step_5100000.pt,checkpoints/dqn_ALE_Pong-v5_step_5100000.pt,100.0,5,5,18.2,1.4696938456699067,17,20,21.0,2.8,2,1938.2
+best_model.pt,checkpoints/best_model.pt,100.0,5,5,18.2,1.9390719429665315,15,20,21.0,2.8,3,1965.4
+dqn_ALE_Pong-v5_step_3900000.pt,checkpoints/dqn_ALE_Pong-v5_step_3900000.pt,100.0,5,5,17.2,0.7483314773547882,16,18,21.0,3.8,2,2169.8
+dqn_ALE_Pong-v5_step_2200000.pt,checkpoints/dqn_ALE_Pong-v5_step_2200000.pt,100.0,5,5,16.8,1.9390719429665317,14,20,21.0,4.2,1,2111.0
+dqn_ALE_Pong-v5_step_2350000.pt,checkpoints/dqn_ALE_Pong-v5_step_2350000.pt,100.0,5,5,16.2,2.0396078054371136,13,19,21.0,4.8,1,2167.2
+dqn_ALE_Pong-v5_step_1350000.pt,checkpoints/dqn_ALE_Pong-v5_step_1350000.pt,100.0,5,5,12.6,3.8262252939417984,7,18,21.0,8.4,1,2788.0
+dqn_ALE_Pong-v5_step_1450000.pt,checkpoints/dqn_ALE_Pong-v5_step_1450000.pt,100.0,5,5,11.6,3.1368774282716245,6,15,21.0,9.4,0,2698.4
