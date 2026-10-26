@@ -35,7 +35,7 @@ class NatureDQN(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Orthogonal/Kaiming initialization as commonly used in modern PyTorch RL."""
+        """Kaiming (He) normal initialization for all conv and linear layers, zero biases."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")

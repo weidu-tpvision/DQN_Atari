@@ -1,6 +1,7 @@
 """Tournament Benchmark script to evaluate and rank multiple Atari DQN checkpoints.
 
-Plays identical matches across fixed seeds for each candidate model, evaluating:
+Plays identical matches across fixed seeds for each candidate model (the seed fixes the
+emulator, sticky actions and the number of reset no-ops), evaluating:
   - Match Win Rate (% of games won to 21 points)
   - Mean Net Score (+21 to -21)
   - Average Points Conceded to CPU (Defense quality)
@@ -19,13 +20,10 @@ Usage:
 """
 
 import os
-import glob
-import re
 import argparse
 import numpy as np
 import pandas as pd
 import torch
-import gymnasium as gym
 
 from src.wrappers import make_atari_env
 from src.agent import DQNAgent
@@ -66,7 +64,7 @@ def parse_args():
     parser.add_argument("--matches", type=int, default=5, help="Number of 21-point matches per checkpoint")
     parser.add_argument("--base-seed", type=int, default=100, help="Base seed (identical across models)")
     parser.add_argument("--output-csv", type=str, default="checkpoints/tournament_results.csv", help="Output CSV path")
-    parser.add_argument("--plot", action="store_true", default=True, help="Generate leaderboard visualization")
+    parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True, help="Generate leaderboard visualization")
     return parser.parse_args()
 
 
@@ -204,13 +202,15 @@ def main():
     print(f"   * Shutout Matches: {champ['shutouts']} of {champ['matches']} games conceded <= 3 points.\n")
 
     # Save to CSV
+    out_dir = os.path.dirname(args.output_csv) or "."
+    os.makedirs(out_dir, exist_ok=True)
     df = pd.DataFrame(leaderboard)
     df.to_csv(args.output_csv, index=False)
     print(f"--> Saved detailed tournament statistics to: {args.output_csv}")
 
     # Optional plot
     if args.plot and len(leaderboard) > 1:
-        plot_tournament_leaderboard(leaderboard, "checkpoints/tournament_leaderboard.png")
+        plot_tournament_leaderboard(leaderboard, os.path.join(out_dir, "tournament_leaderboard.png"))
 
 
 def plot_tournament_leaderboard(leaderboard: list[dict], save_path: str):
@@ -234,7 +234,8 @@ def plot_tournament_leaderboard(leaderboard: list[dict], save_path: str):
     bars1 = ax1.bar(x, net_scores, yerr=net_errors, capsize=4, width=width, color="#2ecc71", edgecolor="#27ae60", alpha=0.85)
     ax1.set_ylabel("Mean Net Score (Agent - CPU)", fontsize=11, fontweight="bold")
     ax1.set_title("Atari Pong DQN Tournament: Contender Comparison", fontsize=13, fontweight="bold", pad=12)
-    ax1.set_ylim(0, 22)
+    ax1.set_ylim(min(0.0, min(n - e for n, e in zip(net_scores, net_errors)) - 1.0), 22)
+    ax1.axhline(0.0, color="#34495e", linewidth=0.8)
     ax1.axhline(21.0, color="#7f8c8d", linestyle="--", alpha=0.6, label="Perfect Game (+21.0)")
     ax1.legend(loc="upper right")
 
@@ -249,7 +250,7 @@ def plot_tournament_leaderboard(leaderboard: list[dict], save_path: str):
     ax2.set_xlabel("Checkpoint", fontsize=11, fontweight="bold")
     ax2.set_xticks(x)
     ax2.set_xticklabels(models, rotation=25, ha="right", fontsize=9)
-    ax2.set_ylim(0, 15)
+    ax2.set_ylim(0, max(15.0, max(cpu_conceded) + 2.0))
 
     for bar in bars2:
         h = bar.get_height()

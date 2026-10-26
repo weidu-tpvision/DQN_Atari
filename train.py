@@ -12,13 +12,12 @@ import sys
 import time
 import random
 import signal
-import csv
+import json
 import argparse
 import numpy as np
 import torch
 
 from src.wrappers import make_atari_env
-from src.model import NatureDQN
 from src.replay_buffer import ReplayBuffer
 from src.agent import DQNAgent
 from src.utils import set_seed, get_device, MetricTracker
@@ -36,8 +35,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (Adam)")
     parser.add_argument("--eps-start", type=float, default=1.0, help="Initial exploration rate")
     parser.add_argument("--eps-end", type=float, default=0.02, help="Final exploration rate")
-    parser.add_argument("--eps-decay", type=int, default=250_000, help="Steps to decay epsilon to min")
-    parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Target network update frequency")
+    parser.add_argument("--eps-decay", type=int, default=1_000_000, help="Environment steps to anneal epsilon from start to end")
+    parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Gradient updates between target network syncs")
     parser.add_argument("--train-freq", type=int, default=4, help="Agent steps between training updates")
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving checkpoints")
     parser.add_argument("--eval-freq", type=int, default=25_000, help="Step interval to run greedy policy evaluation (<=0 to disable)")
@@ -47,11 +46,19 @@ def parse_args():
     parser.add_argument("--double-dqn", action="store_true", help="Enable Double DQN target calculation")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--replay-path", type=str, default=None, help="Path to replay buffer npz to resume from")
-    parser.add_argument("--save-buffer", action="store_true", default=True, help="Whether to save replay buffer on checkpoints")
+    parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
     parser.add_argument("--early-stop-score", type=float, default=None, help="Stop early if mean evaluation score reaches this threshold (None to disable)")
     parser.add_argument("--patience", type=int, default=0, help="Stop early if no improvement over best evaluation score for N evaluations (0 to disable)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
+
+
+def is_game_over(env) -> bool:
+    """True when the real game ended (not just a life lost under EpisodicLifeEnv)."""
+    try:
+        return bool(env.get_wrapper_attr("was_real_done"))
+    except AttributeError:
+        return True
 
 
 def evaluate_policy(agent, env_id: str, num_episodes: int = 5, seed: int = 123) -> dict:
@@ -119,20 +126,19 @@ def train(args):
     tracker = MetricTracker(window_size=100)
     start_step = 1
     episode_count = 0
+    checkpoint_data = {}
 
     # Handle Resumption
     if args.resume:
         print(f"\n--> Resuming training from checkpoint: {args.resume}")
         checkpoint_data = agent.load(args.resume)
-        start_step = checkpoint_data.get("global_step", checkpoint_data.get("total_steps", 0)) + 1
+        # load() restores env_steps (epsilon schedule) and num_updates (target sync)
+        start_step = agent.env_steps + 1
         episode_count = checkpoint_data.get("episode_count", 0)
-        episode_reward = checkpoint_data.get("episode_reward", 0.0)
-        episode_length = checkpoint_data.get("episode_length", 0)
-        agent.total_steps = checkpoint_data.get("total_steps", start_step)
 
         # Restore metric tracker history so running averages are continuous
         if "tracker_history" in checkpoint_data:
-            tracker.history = checkpoint_data["tracker_history"]
+            tracker.load(checkpoint_data["tracker_history"])
 
         # Restore RNG states for exact pseudo-random sequence continuity
         if "rng_state" in checkpoint_data:
@@ -203,6 +209,7 @@ def train(args):
 
     log_file_path = os.path.join(args.save_dir, "training.log")
     log_file = open(log_file_path, "a", buffering=1)
+    log_file.write(f"Config: {json.dumps(vars(args))}\n")
 
     csv_file_path = os.path.join(args.save_dir, "training_metrics.csv")
     csv_exists = os.path.exists(csv_file_path) and os.path.getsize(csv_file_path) > 0
@@ -218,14 +225,15 @@ def train(args):
         eval_csv_file.write("step,mean_score,std_score,min_score,max_score,mean_length,elapsed_seconds\n")
         eval_csv_file.flush()
 
-    best_eval_score = -float("inf")
-    if args.resume and "checkpoint_data" in locals():
-        best_eval_score = checkpoint_data.get("best_eval_score", -float("inf"))
-    patience_counter = 0
+    best_eval_score = checkpoint_data.get("best_eval_score", -float("inf"))
+    patience_counter = checkpoint_data.get("patience_counter", 0)
 
-    state, _ = env.reset(seed=args.seed)
-    episode_reward = 0.0
-    episode_length = 0
+    # The emulator state isn't checkpointed, so a resumed run starts a fresh game
+    state, _ = env.reset(seed=args.seed + start_step - 1)
+    # Per-episode (per life under EpisodicLifeEnv) and per-game accumulators.
+    # tracker ep_reward/ep_length are per *game* (clipped rewards).
+    game_reward = 0.0
+    game_length = 0
     start_time = time.time()
 
     if start_step <= args.replay_start_size and len(replay_buffer) < args.replay_start_size:
@@ -235,11 +243,10 @@ def train(args):
         extra = {
             "global_step": step_num,
             "episode_count": episode_count,
-            "episode_reward": episode_reward,
-            "episode_length": episode_length,
             "best_eval_score": best_eval_score,
-            "total_steps": agent.total_steps,
+            "patience_counter": patience_counter,
             "tracker_history": tracker.history,
+            "config": vars(args),
             "rng_state": {
                 "python": random.getstate(),
                 "numpy": np.random.get_state(),
@@ -266,9 +273,12 @@ def train(args):
         for step in range(start_step, target_total_steps + 1):
             current_step = step
             if interrupted:
-                save_checkpoint(step, is_latest=True)
+                # Step `step` has not run yet, so the last completed step is step - 1
+                save_checkpoint(step - 1, is_latest=True)
                 print("Checkpoint saved successfully. Exiting gracefully.")
                 sys.exit(0)
+
+            agent.env_steps = step
 
             # Action selection (random during warm-up if buffer not yet filled, epsilon-greedy afterwards)
             if len(replay_buffer) < args.replay_start_size:
@@ -284,15 +294,16 @@ def train(args):
             replay_buffer.push(state, action, reward, next_state, terminated)
 
             state = next_state
-            episode_reward += reward
-            episode_length += 1
+            game_reward += reward
+            game_length += 1
 
             if done:
                 episode_count += 1
-                tracker.update(ep_reward=episode_reward, ep_length=episode_length)
+                if is_game_over(env):
+                    tracker.update(ep_reward=game_reward, ep_length=game_length)
+                    game_reward = 0.0
+                    game_length = 0
                 state, _ = env.reset()
-                episode_reward = 0.0
-                episode_length = 0
 
             # Training step
             if len(replay_buffer) >= args.replay_start_size and step % args.train_freq == 0:
@@ -356,6 +367,7 @@ def train(args):
                             "global_step": step,
                             "episode_count": episode_count,
                             "best_eval_score": best_eval_score,
+                            "config": vars(args),
                         },
                     )
                     print(f"--> [NEW BEST MODEL] High score: {best_eval_score:6.2f} saved to {best_path}!\n", flush=True)
@@ -387,7 +399,7 @@ def train(args):
         csv_file.close()
         eval_csv_file.close()
         env.close()
-        raise e
+        raise
 
     # Final save
     final_step = current_step

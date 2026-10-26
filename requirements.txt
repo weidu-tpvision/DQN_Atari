@@ -1,3 +1,7 @@
+# Exact environment used for the reported runs (Linux, CUDA 13, NVIDIA GB10 / sm_121).
+# torch is a nightly build that is not on PyPI; install it first, e.g.:
+#   pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
+# On other machines, replace the torch/nvidia-*/cuda-*/triton pins with a stable torch for your CUDA.
 ale-py==0.12.1
 cloudpickle==3.1.2
 contourpy==1.4.0
@@ -41,8 +45,6 @@ pandas==3.1.0
 pettingzoo==1.27.0
 pillow==12.3.0
 pluggy==1.7.0
-pygame==2.6.1
-pygame-ce==2.5.8
 Pygments==2.21.0
 pyparsing==3.3.3
 pytest==9.1.1
@@ -51,7 +53,6 @@ setuptools==78.1.0
 six==1.17.0
 sympy==1.14.0
 torch==2.16.0.dev20261023+cu130
-torchvision==0.20.1
 triton==3.9.0+gitfc8d31a5
 typing_extensions==4.16.0
 tzdata==2026.5

@@ -14,7 +14,6 @@ import argparse
 import numpy as np
 import cv2
 import torch
-import gymnasium as gym
 
 # Avoid indirect OpenGL/GLX errors over SSH X11 forwarding
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
@@ -67,7 +66,7 @@ def main():
     )
 
     agent = DQNAgent(num_actions=env.action_space.n, device=device)
-    agent.load(args.checkpoint)
+    agent.load_weights(args.checkpoint)
     print(f"Loaded checkpoint from: {args.checkpoint}")
 
     state, _ = env.reset(seed=args.seed)
@@ -78,9 +77,12 @@ def main():
     matches_won = 0
     matches_played = 0
     total_steps = 0
-    action_names = ["NOOP", "FIRE", "RIGHT", "LEFT", "RIGHTFIRE", "LEFTFIRE"]
+    action_names = env.unwrapped.get_action_meanings()
 
-    max_steps = args.frames if (args.frames > 0 or args.mode != "human") else (1500 if args.mode != "human" else 10**9)
+    if args.frames > 0:
+        max_steps = args.frames
+    else:
+        max_steps = 10**9 if args.mode == "human" else 1500
 
     if args.mode == "human":
         print("Starting live GUI window (Press 'q' or ESC on the window to exit)...")
@@ -99,9 +101,10 @@ def main():
 
         # Capture RGB frame from emulator
         rgb = env.unwrapped.render()
-        
-        # Scale up frame and add HUD overlay
-        frame = cv2.resize(rgb, (560, 420), interpolation=cv2.INTER_NEAREST)
+
+        # Scale up frame (OpenCV expects BGR) and add HUD overlay
+        frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        frame = cv2.resize(frame, (560, 420), interpolation=cv2.INTER_NEAREST)
         
         # HUD overlay banner
         overlay = frame.copy()
@@ -138,8 +141,8 @@ def main():
             won = agent_pts > cpu_pts
             if won:
                 matches_won += 1
-            result_str = "WON" if won else "LOST"
-            print(f"Match {matches_played:2d} Finished: Agent {agent_pts} - CPU {cpu_pts} (Diff: {diff_str}) -> {result_str} | Total Won: {matches_won}/{matches_played}")
+            result_str = "WON" if won else ("DRAW" if agent_pts == cpu_pts else "LOST")
+            print(f"Match {matches_played:2d} Finished: Agent {agent_pts} - CPU {cpu_pts} (Diff: {agent_pts - cpu_pts:+d}) -> {result_str} | Total Won: {matches_won}/{matches_played}")
             state, _ = env.reset()
             agent_pts = 0
             cpu_pts = 0
@@ -157,6 +160,9 @@ def main():
         print(f"--> Successfully created GIF: {args.output} (Size: {os.path.getsize(args.output) / 1024 / 1024:.2f} MB)")
     elif args.mode == "mp4":
         print(f"Encoding {len(recorded_frames)} frames to MP4: {args.output}...")
+        if not recorded_frames:
+            print("No frames recorded.")
+            return
         h, w, _ = recorded_frames[0].shape
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(args.output, fourcc, args.fps, (w, h))

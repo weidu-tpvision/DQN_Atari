@@ -1,7 +1,7 @@
 """Utility functions for DQN."""
 
-import os
 import random
+from collections import deque
 import numpy as np
 import torch
 
@@ -28,7 +28,7 @@ def get_device() -> torch.device:
             print(f"Using GPU: {torch.cuda.get_device_name(0)}")
             return device
         except Exception as e:
-            print(f"CUDA device detected ({torch.cuda.get_device_name(0)}), but kernel execution failed: {e}")
+            print(f"CUDA device detected, but kernel execution failed: {e}")
             print("Falling back to high-performance CPU (using multi-core PyTorch).")
 
     device = torch.device("cpu")
@@ -37,7 +37,11 @@ def get_device() -> torch.device:
 
 
 class MetricTracker:
-    """Tracks running averages and windowed stats for training metrics."""
+    """Tracks windowed running averages for training metrics.
+
+    Only the last `window_size` values per metric are kept, so checkpoints that store
+    `history` stay a constant size.
+    """
 
     def __init__(self, window_size: int = 100):
         self.window_size = window_size
@@ -46,11 +50,14 @@ class MetricTracker:
     def update(self, **kwargs):
         for k, v in kwargs.items():
             if k not in self.history:
-                self.history[k] = []
+                self.history[k] = deque(maxlen=self.window_size)
             self.history[k].append(v)
 
     def mean(self, key: str) -> float:
         if key not in self.history or len(self.history[key]) == 0:
             return 0.0
-        window = self.history[key][-self.window_size:]
-        return float(np.mean(window))
+        return float(np.mean(self.history[key]))
+
+    def load(self, history: dict) -> None:
+        """Restore history from a checkpoint (accepts old unbounded lists)."""
+        self.history = {k: deque(list(v)[-self.window_size:], maxlen=self.window_size) for k, v in history.items()}

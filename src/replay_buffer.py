@@ -6,6 +6,7 @@ Reference:
     Mnih et al., Nature 518, 529–533 (2015).
 """
 
+import os
 from typing import Tuple
 import numpy as np
 import torch
@@ -92,20 +93,38 @@ class ReplayBuffer:
             rewards=self.rewards[:self.size],
             dones=self.dones[:self.size],
         )
-        import os
         os.replace(tmp_path, path)
 
     def load(self, path: str) -> None:
-        """Load replay buffer state from compressed npz file."""
+        """Load replay buffer state from compressed npz file.
+
+        Handles a capacity different from the one the buffer was saved with: the most recent
+        min(saved_size, capacity) transitions are kept in chronological order.
+        """
         data = np.load(path)
-        self.ptr = int(data["ptr"])
-        self.size = int(data["size"])
+        saved_ptr = int(data["ptr"])
         loaded_size = len(data["actions"])
-        self.states[:loaded_size] = data["states"]
-        self.next_states[:loaded_size] = data["next_states"]
-        self.actions[:loaded_size] = data["actions"]
-        self.rewards[:loaded_size] = data["rewards"]
-        self.dones[:loaded_size] = data["dones"]
+        if data["states"].shape[1:] != self.states.shape[1:]:
+            raise ValueError(
+                f"Replay buffer state shape {data['states'].shape[1:]} does not match {self.states.shape[1:]}"
+            )
+
+        keys = ("states", "next_states", "actions", "rewards", "dones")
+        same_layout = loaded_size == self.capacity or (loaded_size < self.capacity and saved_ptr == loaded_size)
+        if same_layout:
+            for k in keys:
+                getattr(self, k)[:loaded_size] = data[k]
+            self.ptr = saved_ptr % self.capacity
+            self.size = loaded_size
+            return
+
+        # Reorder oldest -> newest (a full saved buffer starts at saved_ptr), keep the newest part
+        order = np.roll(np.arange(loaded_size), -saved_ptr)
+        keep = order[-min(loaded_size, self.capacity):]
+        for k in keys:
+            getattr(self, k)[:len(keep)] = data[k][keep]
+        self.size = len(keep)
+        self.ptr = self.size % self.capacity
 
     def __len__(self) -> int:
         return self.size

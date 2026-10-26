@@ -20,8 +20,7 @@ def parse_args():
     parser.add_argument("--train-log", type=str, default=None, help="Path to training_metrics.csv")
     parser.add_argument("--eval-log", type=str, default=None, help="Path to eval_metrics.csv")
     parser.add_argument("--output", type=str, default="learning_progress.png", help="Path to save output figure")
-    parser.add_argument("--show", action="store_true", default=True, help="Display the plot in a window on desktop")
-    parser.add_argument("--no-show", dest="show", action="store_false", help="Save the plot without displaying a window")
+    parser.add_argument("--show", action=argparse.BooleanOptionalAction, default=True, help="Display the plot in a window on desktop (--no-show to only save)")
     return parser.parse_args()
 
 
@@ -46,7 +45,7 @@ def main():
     # 1. Performance / Score Panel: Training Rolling Score vs. True Greedy Evaluation Score
     ax1 = axes[0]
     if has_train and "avg_reward_100" in train_df.columns:
-        ax1.plot(train_df["step"], train_df["avg_reward_100"], label="Training (100-Ep Rolling, with Exploration)", color="#1f77b4", alpha=0.8, linewidth=2)
+        ax1.plot(train_df["step"], train_df["avg_reward_100"], label="Training (100-Game Rolling, Clipped Rewards, with Exploration)", color="#1f77b4", alpha=0.8, linewidth=2)
     if has_eval and "mean_score" in eval_df.columns:
         ax1.plot(eval_df["step"], eval_df["mean_score"], label="Evaluation (Greedy Policy, Epsilon=0)", color="#2ca02c", marker="o", linewidth=2.5)
         if "std_score" in eval_df.columns:

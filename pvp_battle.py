@@ -23,36 +23,10 @@ import sys
 import argparse
 import numpy as np
 import cv2
-import torch
-from collections import deque
 
-os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-
-from pettingzoo.atari import pong_v3
 from src.agent import DQNAgent
-from src.utils import get_device
-
-
-def remap_pz_to_gym(pz_rgb: np.ndarray) -> np.ndarray:
-    """Remap PettingZoo Pong 2P color palette to match standard Gymnasium ALE/Pong-v5."""
-    gym_rgb = pz_rgb.copy()
-    bg_mask = np.all(pz_rgb == [144, 72, 17], axis=-1)
-    r_mask = np.all(pz_rgb == [92, 186, 92], axis=-1)
-    l_mask = np.all(pz_rgb == [213, 130, 74], axis=-1)
-    gym_rgb[bg_mask] = [109, 118, 43]
-    gym_rgb[r_mask] = [101, 111, 228]
-    gym_rgb[l_mask] = [101, 111, 228]
-    return gym_rgb
-
-
-def process_frame(rgb: np.ndarray, flip: bool = False) -> np.ndarray:
-    """Preprocess 210x160 RGB into 84x84 grayscale matching ALE/Pong-v5, optionally flipped."""
-    remapped = remap_pz_to_gym(rgb)
-    gray = cv2.cvtColor(remapped, cv2.COLOR_RGB2GRAY)
-    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
-    if flip:
-        resized = cv2.flip(resized, 1)
-    return resized
+from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
+from src.utils import get_device, set_seed
 
 
 def parse_args():
@@ -76,22 +50,14 @@ def parse_args():
     parser.add_argument("--frames", type=int, default=1500, help="Max frames for gif/mp4 recording")
     parser.add_argument("--fps", type=int, default=35, help="Playback speed in human mode")
     parser.add_argument("--output", type=str, default="pvp_battle.gif", help="Output file path for gif/mp4")
-    parser.add_argument("--swap-sides", action="store_true", default=True, help="Alternate paddle sides between matches for fair play")
+    parser.add_argument("--swap-sides", action=argparse.BooleanOptionalAction, default=True, help="Alternate paddle sides between matches for fair play")
+    parser.add_argument("--seed", type=int, default=200, help="Base seed for match resets and epsilon noise")
     return parser.parse_args()
-
-
-def select_action(agent: DQNAgent, stack: deque, device: str, epsilon: float = 0.0) -> int:
-    """Select action using DQN network with optional epsilon-greedy perturbation."""
-    if epsilon > 0.0 and np.random.rand() < epsilon:
-        return np.random.randint(6)
-    s_tensor = torch.as_tensor(np.array(stack), device=device).unsqueeze(0)
-    with torch.no_grad():
-        q_vals = agent.online_net(s_tensor)[0].cpu().numpy()
-        return int(np.argmax(q_vals))
 
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     device = get_device()
 
     p1_name = os.path.basename(args.p1).replace(".pt", "")
@@ -108,15 +74,13 @@ def main():
     print(f"--------------------------------------------------------------------------\n")
 
     # Load both agents
-    agent1 = DQNAgent(num_actions=6, device=device)
-    agent1.load(args.p1)
+    agent1 = DQNAgent(num_actions=NUM_ACTIONS, device=device)
+    agent1.load_weights(args.p1)
 
-    agent2 = DQNAgent(num_actions=6, device=device)
-    agent2.load(args.p2)
+    agent2 = DQNAgent(num_actions=NUM_ACTIONS, device=device)
+    agent2.load_weights(args.p2)
 
     display_action_map = {0: "NOOP", 1: "FIRE", 2: "UP", 3: "DOWN", 4: "UPFIRE", 5: "DOWNFIRE"}
-
-    env = pong_v3.parallel_env(render_mode="rgb_array")
 
     if args.mode == "human":
         if not os.environ.get("DISPLAY"):
@@ -126,14 +90,20 @@ def main():
             print("  2. Alternatively, view live terminal scores: '--mode headless'")
             print("  3. Or render an animated replay to watch directly: '--mode gif --output pvp_duel.gif'\n")
             sys.exit(1)
+        # Avoid indirect OpenGL/GLX errors over SSH X11 forwarding
+        os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
         cv2.namedWindow("DQN Head-to-Head Arena", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("DQN Head-to-Head Arena", 640, 480)
         print("Starting live GUI window. Press 'q' or ESC on the game window anytime to exit.\n")
+
+    render = args.mode in ["human", "gif", "mp4"]
+    game = TwoPlayerPong(render_mode="rgb_array" if render else None)
 
     recorded_frames = []
     matches_played = 0
     p1_match_wins = 0
     p2_match_wins = 0
+    draws = 0
 
     target_matches = args.matches if args.mode in ["headless", "human"] else 1
     total_frames_recorded = 0
@@ -147,69 +117,34 @@ def main():
         right_label = p2_name if swap else p1_name
         left_label = p1_name if swap else p2_name
 
-        obs, _ = env.reset(seed=200 + matches_played)
-        obs_buffer = np.zeros((2, 210, 160, 3), dtype=np.uint8)
-        right_stack = deque([process_frame(obs["first_0"], flip=False)] * 4, maxlen=4)
-        left_stack = deque([process_frame(obs["second_0"], flip=True)] * 4, maxlen=4)
-
+        right_state, left_state = game.reset(seed=args.seed + matches_played)
         right_pts = 0
         left_pts = 0
-        match_step = 0
 
         print(f">>> STARTING MATCH {matches_played + 1}/{target_matches}:")
         print(f"    [Left / Orange]  {left_label}")
         print(f"    [Right / Green]  {right_label}")
 
         while True:
-            match_step += 1
             total_frames_recorded += 1
 
-            act_right = select_action(right_agent, right_stack, device, epsilon=args.epsilon)
-            act_left = select_action(left_agent, left_stack, device, epsilon=args.epsilon)
+            act_right = policy_action(right_agent, right_state, args.epsilon)
+            act_left = policy_action(left_agent, left_state, args.epsilon)
 
-            r_right_total = 0
-            r_left_total = 0
-            done = False
+            r_right, r_left, done = game.step(act_right, act_left)
+            right_state, left_state = game.observe()
 
-            # Frame skip 4 with 2-frame max pooling to eliminate sprite flicker
-            for i in range(4):
-                obs, rewards, term, trunc, _ = env.step({"first_0": act_right, "second_0": act_left})
-                if rewards["first_0"] > 0:
-                    r_right_total += int(rewards["first_0"])
-                if rewards["second_0"] > 0:
-                    r_left_total += int(rewards["second_0"])
-
-                if i == 2:
-                    obs_buffer[0] = obs["first_0"]
-                elif i == 3:
-                    obs_buffer[1] = obs["first_0"]
-
-                if term["first_0"] or trunc["first_0"] or term["second_0"] or trunc["second_0"]:
-                    if i < 2:
-                        obs_buffer[0] = obs["first_0"]
-                        obs_buffer[1] = obs["first_0"]
-                    elif i == 2:
-                        obs_buffer[1] = obs["first_0"]
-                    done = True
-                    break
-
-            if r_right_total > 0:
-                right_pts += r_right_total
-                scorer = right_label
+            if r_right > 0:
+                right_pts += r_right
                 print(f"    Point! [{right_label} scored] Scoreboard: {left_label} {left_pts} - {right_pts} {right_label}", flush=True)
-            elif r_left_total > 0:
-                left_pts += r_left_total
-                scorer = left_label
+            if r_left > 0:
+                left_pts += r_left
                 print(f"    Point! [{left_label} scored] Scoreboard: {left_label} {left_pts} - {right_pts} {right_label}", flush=True)
 
-            pooled_rgb = obs_buffer.max(axis=0)
-            right_stack.append(process_frame(pooled_rgb, flip=False))
-            left_stack.append(process_frame(pooled_rgb, flip=True))
-
-            # Visual Rendering
-            if args.mode in ["human", "gif", "mp4"]:
-                rgb = env.render()
-                frame = cv2.resize(rgb, (640, 480), interpolation=cv2.INTER_NEAREST)
+            # Visual Rendering (OpenCV expects BGR)
+            if render:
+                frame = cv2.cvtColor(game.render(), cv2.COLOR_RGB2BGR)
+                frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
 
                 # HUD Overlay
                 overlay = frame.copy()
@@ -235,7 +170,7 @@ def main():
                     key = cv2.waitKey(max(1, int(1000 / args.fps))) & 0xFF
                     if key == ord("q") or key == 27:
                         print("\nExiting PvP Arena...")
-                        env.close()
+                        game.close()
                         cv2.destroyAllWindows()
                         return
                 else:
@@ -253,17 +188,20 @@ def main():
 
         if p1_pts > p2_pts:
             p1_match_wins += 1
-            winner = p1_name
-        else:
+            result = f"{p1_name} WINS!"
+        elif p2_pts > p1_pts:
             p2_match_wins += 1
-            winner = p2_name
+            result = f"{p2_name} WINS!"
+        else:
+            draws += 1
+            result = "DRAW"
 
-        print(f"--> MATCH {matches_played} FINAL: {p1_name} {p1_pts} - {p2_pts} {p2_name} | {winner} WINS! (Series: {p1_name} {p1_match_wins} - {p2_match_wins} {p2_name})\n")
+        print(f"--> MATCH {matches_played} FINAL: {p1_name} {p1_pts} - {p2_pts} {p2_name} | {result} (Series: {p1_name} {p1_match_wins} - {p2_match_wins} {p2_name}, {draws} draws)\n")
 
         if args.mode in ["gif", "mp4"] and total_frames_recorded >= args.frames:
             break
 
-    env.close()
+    game.close()
     if args.mode == "human":
         cv2.destroyAllWindows()
 
@@ -273,6 +211,8 @@ def main():
     print(f"Total Matches Played: {matches_played}")
     print(f"  * {p1_name}: {p1_match_wins} match wins ({p1_match_wins / max(1, matches_played) * 100:.1f}%)")
     print(f"  * {p2_name}: {p2_match_wins} match wins ({p2_match_wins / max(1, matches_played) * 100:.1f}%)")
+    if draws:
+        print(f"  * Draws: {draws}")
 
     if p1_match_wins > p2_match_wins:
         print(f"\n🏆 HEAD-TO-HEAD GRAND CHAMPION: {p1_name}!\n")

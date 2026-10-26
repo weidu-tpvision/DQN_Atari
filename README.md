@@ -9,12 +9,25 @@ A high-performance, modular, and readable PyTorch implementation of the landmark
 
 ## Key Features
 
-- **Exact Nature 2015 CNN Architecture**: 3 convolutional layers ($8\times 8$ stride 4, $4\times 4$ stride 2, $3\times 3$ stride 1) followed by a 512-unit fully connected layer and linear Q-value heads.
+- **Nature 2015 CNN Architecture**: 3 convolutional layers ($8\times 8$ stride 4, $4\times 4$ stride 2, $3\times 3$ stride 1) followed by a 512-unit fully connected layer and linear Q-value heads.
 - **Gymnasium + ALE Atari Integration**: Clean, modern environment wrappers handling frame skipping ($k=4$), sprite flicker removal (max-pooling over 2 frames), grayscale conversion, downsampling ($84\times 84$), frame stacking ($k=4$), and reward clipping ($\{-1, 0, +1\}$).
 - **Episodic Life Loss**: End-of-life treated as terminal for Bellman bootstrapping, encouraging survival without forcing an emulator reset.
-- **Memory-Optimized Experience Replay**: Observations stored as compact `uint8` arrays, preventing out-of-memory errors and enabling blazing fast vectorized sampling.
+- **Compact Experience Replay**: Observations stored as `uint8` arrays (normalized on the GPU), with fast vectorized sampling.
 - **Huber Loss (Smooth L1)**: Matches the paper's $[-1, 1]$ TD-error gradient clipping for numerical stability.
-- **Frozen Target Network ($\theta^-$)**: Hard-sync every $C$ steps to eliminate moving-target feedback loops.
+- **Frozen Target Network ($\theta^-$)**: Hard-sync every $C$ gradient updates to eliminate moving-target feedback loops.
+
+### Deviations from the Nature 2015 setup
+
+| Setting | Nature 2015 | This repo (defaults) |
+| :--- | :--- | :--- |
+| Environment | deterministic ALE (no sticky actions) | `ALE/Pong-v5`: sticky actions, `repeat_action_probability=0.25` |
+| Optimizer | RMSProp, lr 2.5e-4 | Adam, lr 1e-4, plus gradient-norm clipping at 10 |
+| Replay memory / start | 1,000,000 / 50,000 | 100,000 / 10,000 |
+| Target update $C$ | 10,000 gradient updates | 1,000 gradient updates (= 4,000 env steps) |
+| Epsilon | 1.0 → 0.1 over 1M steps | 1.0 → 0.02 over 1M env steps |
+| Evaluation epsilon | 0.05 | 0 (greedy); `evaluate.py --epsilon 0.05` for the paper protocol |
+| Weight init | default | Kaiming normal |
+| Replay storage | — | full 4-frame stacks for $s$ and $s'$ (~5.6 GB for 100k transitions) |
 
 ---
 
@@ -50,18 +63,21 @@ atari/
 ├── README.md                       # Complete documentation & usage guide
 ├── requirements.txt                # Python dependencies
 ├── .gitignore                      # Git exclusion rules for large models/buffers
+├── pytest.ini
 ├── src/
 │   ├── __init__.py
 │   ├── model.py                    # NatureDQN ConvNet with on-device normalization
 │   ├── wrappers.py                 # Preprocessing & frame stacking wrappers
+│   ├── pong2p.py                   # Shared 2-player Pong (PettingZoo) pipeline for all PvP/self-play scripts
 │   ├── replay_buffer.py            # Vectorized uint8 circular replay buffer with atomic serialization
 │   ├── agent.py                    # DQNAgent: Double DQN, Huber loss, target sync, atomic saving
 │   └── utils.py                    # Seeding, GPU/device detection, metric tracker
-├── tests/
-│   ├── test_model.py               # Unit tests for network shape and init
-│   ├── test_replay_buffer.py       # Unit tests for circular buffer
-│   └── test_wrappers.py            # Unit tests for environment pipeline
+├── tests/                          # Unit, CLI and web-server tests (pytest)
+├── checkpoints/                    # Pong run: metrics CSVs + plots (checkpoints & buffers are git-ignored)
+├── checkpoints_breakout/           # Breakout run metrics
+├── checkpoints_selfplay/           # Self-play run metrics
 ├── train.py                        # Resumable training loop with crash resilience & atomic saves
+├── train_selfplay.py               # Fictitious self-play trainer (PettingZoo pong_v3)
 ├── evaluate.py                     # Deterministic greedy evaluation script
 ├── record_demo.py                  # Live X11 GUI visualizer with match HUD overlay
 ├── plot_metrics.py                 # 4-panel training and evaluation telemetry dashboard
@@ -70,8 +86,6 @@ atari/
 ├── round_robin_tournament.py       # 10-player Round-Robin League (90 matches, cross-table matrix)
 └── play_remote.py                  # Playable Human vs AI Arena with desktop & web remote controls
 ```
-
----
 
 ---
 
@@ -85,7 +99,7 @@ The agent was trained from scratch for **10,000,000 environment interaction step
 
 | Milestone Steps | Greedy Eval Score (Mean ± Std) | Win Rate vs CPU | Conceded Pts / Game | Performance State & Observed Behavior |
 | :--- | :--- | :--- | :--- | :--- |
-| **0 – 250k** | `-21.00 ± 0.00` | 0.0% | 21.0 | Pure random walk; epsilon decaying from 1.0 down to 0.02. |
+| **0 – 250k** | `-21.00 ± 0.00` | 0.0% | 21.0 | Mostly random play (epsilon ≈ 0.76 at 250k; it reached 0.02 at ~1.01M steps). |
 | **500k** | `-13.80 ± 2.40` | 0.0% | 21.0 | First returns: agent begins tracking paddle vertically to intercept slow volleys. |
 | **1.5M** | `+15.10 ± 2.91` | **100.0%** | ~5.9 | **Game Victory Achieved**: agent wins every match (e.g., 21–6), though still drops balls during extended rallies. |
 | **2.2M** | `+18.00 ± 1.41` | **100.0%** | ~3.0 | **Angle Mastery**: agent learns to strike balls with the edge of the paddle, slicing sharp returns into CPU blind spots. |
@@ -101,7 +115,7 @@ The 4-panel dashboard in `learning_progress.png` illustrates the learning dynami
 
 1. **Episode Reward Curve**: Shows a steep sigmoid ascent between 500k and 1.5M steps, crossing the zero-threshold at ~1.0M steps and saturating near +18 to +20 by 3.5M–5M steps.
 2. **Huber TD Loss**: Spikes during the initial transition from random exploration to early policy learning (200k–500k steps) where Bellman errors are highest, before decaying smoothly and stabilizing around ~0.001–0.002.
-3. **Q-Value Growth**: Mean action-values increase steadily from 0 towards ~1.5–2.0, showing steady value function convergence without overestimation divergence (guaranteed by Double DQN target formulation).
+3. **Q-Value Growth**: Mean action-values increase steadily from 0 towards ~1.5–2.0, with no sign of runaway overestimation.
 4. **Greedy Evaluation vs. Exploration**: Deterministic greedy evaluation ($\epsilon = 0$) consistently outscores rolling training reward by +1 to +2 points because greedy play completely eliminates the 2% random exploratory mistakes ($\epsilon = 0.02$) that cause occasional dropped balls.
 
 ---
@@ -116,7 +130,7 @@ Extended training from 1.5M to 10M steps was specifically required to eliminate 
 A striking empirical phenomenon emerged when comparing the **CPU Tournament** vs. the **10-Player Round-Robin PvP League**:
 - **Against the Atari Stella CPU (Deterministic Heuristic)**: Performance scaled monotonically with training steps. The final `step_10000000.pt` checkpoint was the absolute master, conceding only 1.8 points/game.
 - **In Head-to-Head Neural Network PvP**: The intermediate checkpoint **`step_2200000.pt`** won the 90-match Round-Robin League (12 Wins - 6 Losses, `+24` point differential), outperforming the 10M step model. 
-- **Root Cause**: Over 10M steps, the policy increasingly specialized against the deterministic return angles of the Atari Stella CPU. In contrast, intermediate checkpoints (2.2M steps) retained a broader, more exploratory and varied repertoire of return trajectories, making their shots harder for opposing neural networks to anticipate.
+- **Hypothesis**: Over 10M steps, the policy may have specialized against the return angles of the Atari Stella CPU, while intermediate checkpoints kept a more varied repertoire. Treat this as tentative: the league had only 2 games per pairing (18 per model), the top two finished level at 12–6, and it ran on an older 2-player pipeline without max-pooling. Rerun `round_robin_tournament.py` (ideally with more games per pairing) before drawing conclusions.
 
 #### C. Zero-Shot 2-Player Control via Symmetric Vision
 In PettingZoo Pong, Player 1 controls the right paddle (Green) and Player 2 controls the left paddle (Orange). By applying a horizontal flip (`cv2.flip(frame, 1)`) to Player 2's stacked frames, the exact same Nature DQN policy trained solely on the right paddle was able to control the left paddle with zero weight changes or fine-tuning.
@@ -126,7 +140,7 @@ In PettingZoo Pong, Player 1 controls the right paddle (Green) and Player 2 cont
 ### 4. Conclusions
 
 1. **Architectural Validation**: The Nature 2015 3-Conv + 2-FC architecture combined with canonical Atari wrappers reliably solves `ALE/Pong-v5` to superhuman level.
-2. **Double DQN Stability**: Decoupling action selection from action evaluation prevented runaway Q-value inflation, producing smooth monotonic policy improvement.
+2. **Stability**: Q-values stayed bounded and policy improvement was smooth. (The run configuration was not recorded at the time, so whether `--double-dqn` was enabled can't be confirmed; runs now log their full config to `training.log` and every checkpoint.)
 3. **Training Horizons**: While game-level victory is established by ~1.5M steps, attaining true superhuman mastery and sub-2-point conceded averages requires 5M to 10M interaction steps.
 
 ---
@@ -138,7 +152,7 @@ Run the live X11 GUI simulation over SSH forwarding (`ssh -Y`):
 ```bash
 .venv/bin/python3 record_demo.py --mode human --fps 35
 ```
-* Automatically loads the champion checkpoint [`checkpoints/champion_model.pt`](file:///home/weidu/WorkAtTPVision/test/atari/checkpoints/champion_model.pt).
+* Automatically loads the champion checkpoint `checkpoints/champion_model.pt` (a symlink to `dqn_ALE_Pong-v5_step_5100000.pt`).
 * Displays live in-game scoreboard: `Agent: 21 | CPU: 7 (Diff: +14) | Matches: W/P`.
 * Plays full matches continuously until you press `q` or `ESC`.
 
@@ -147,14 +161,14 @@ Generate the 4-panel telemetry dashboard:
 ```bash
 .venv/bin/python3 plot_metrics.py
 ```
-Outputs [`learning_progress.png`](file:///home/weidu/WorkAtTPVision/test/atari/learning_progress.png) showing Episode Rewards, Training Loss, Epsilon Annealing, and Greedy Evaluation Curves.
+Outputs [`learning_progress.png`](learning_progress.png) showing Episode Rewards, Training Loss, Epsilon Annealing, and Greedy Evaluation Curves.
 
 ---
 
 ## Competitive Tournaments & Head-to-Head PvP
 
 ### 1. Tournament Against CPU Opponent
-Benchmark all trained checkpoints against the identical set of randomized game seeds to find the best policy:
+Benchmark trained checkpoints on the same game seeds (a seed fixes the emulator, sticky actions and reset no-ops) to find the best policy:
 ```bash
 .venv/bin/python3 tournament.py --matches 5
 ```
@@ -163,7 +177,7 @@ Benchmark all trained checkpoints against the identical set of randomized game s
 * Saves results to `checkpoints/tournament_results.csv` and visual chart to `checkpoints/tournament_leaderboard.png`.
 
 ### 2. Head-to-Head PvP Arena (Agent vs. Agent)
-Pit two neural networks directly against each other with symmetric vision and side-swapping:
+Pit two neural networks directly against each other with symmetric vision and side-swapping (`--no-swap-sides` to disable). Drawn matches are reported as draws:
 ```bash
 # Watch the duel live:
 .venv/bin/python3 pvp_battle.py \
@@ -173,10 +187,11 @@ Pit two neural networks directly against each other with symmetric vision and si
 ```
 
 ### 3. Top 10 Round-Robin League
-Run a full 90-match league where all top 10 checkpoints play every other checkpoint home and away:
+Run a full league (10 checkpoints: 90 matches) where every checkpoint plays every other one home and away:
 ```bash
 .venv/bin/python3 round_robin_tournament.py --target-score 5
 ```
+Results of the original run (older pipeline, see the caveat in section 3.B):
 * **PvP Grand Champion**: `step_2200000.pt` (12 Wins - 6 Losses, `+24` point differential).
 * **PvP Runner-Up**: `best_model.pt` (12 Wins - 6 Losses, `+16` point differential).
 * **PvP Third Place**: `step_10000000.pt` (10 Wins - 8 Losses, `+14` point differential).
@@ -192,8 +207,10 @@ Test your skills directly against the trained DQN agent! `play_remote.py` lets a
 # Option A: Native Desktop X11 window (Controls: [W]/[S]/[SPACE]):
 .venv/bin/python3 play_remote.py --mode x11
 
-# Option B: Web Browser Remote Control (Interactive UI on port 8080):
+# Option B: Web Browser Remote Control (Interactive UI on port 8080, bound to 127.0.0.1):
 .venv/bin/python3 play_remote.py --mode web --port 8080
+#   from another machine: ssh -L 8080:localhost:8080 <host>, then open http://localhost:8080
+#   or expose it on the LAN (no authentication!): --host 0.0.0.0
 ```
 - Real-time match telemetry showing human actions, points, and AI Q-values.
 - Supports both keyboard input and virtual touch/click buttons.
@@ -202,7 +219,7 @@ Test your skills directly against the trained DQN agent! `play_remote.py` lets a
 
 ## Installation
 
-Ensure Python 3.10+ is available. Create the virtual environment and install dependencies:
+Tested with Python 3.12. `requirements.txt` pins the exact environment of the reported runs, including a PyTorch nightly for CUDA 13 that is not on PyPI (see the comment at the top of the file for how to install it, or replace the torch/CUDA pins with a stable build for your GPU). Create the virtual environment and install dependencies:
 
 ```bash
 # 1. Create virtual environment
@@ -239,7 +256,7 @@ To train DQN on Pong (or any other Atari environment) against the built-in Atari
     --replay-start-size 10000 \
     --batch-size 32 \
     --lr 0.0001 \
-    --eps-decay 250000 \
+    --eps-decay 1000000 \
     --target-sync-freq 1000 \
     --save-dir checkpoints
 ```
@@ -255,11 +272,21 @@ To train DQN on Pong (or any other Atari environment) against the built-in Atari
 | `--batch-size` | `32` | Minibatch size for stochastic gradient descent |
 | `--lr` | `1e-4` | Learning rate (Adam optimizer) |
 | `--eps-start` / `--eps-end` | `1.0` / `0.02` | Epsilon exploration bounds |
-| `--eps-decay` | `250,000` | Number of steps to anneal epsilon from start to end |
-| `--target-sync-freq` | `1,000` | Steps between updating target network ($\theta^- \leftarrow \theta$) |
+| `--eps-decay` | `1,000,000` | Environment steps to anneal epsilon from start to end |
+| `--target-sync-freq` | `1,000` | Gradient updates between target network syncs ($\theta^- \leftarrow \theta$); with `--train-freq 4` that is every 4,000 env steps |
 | `--train-freq` | `4` | Agent steps between gradient descent updates |
 | `--save-freq` | `50,000` | Step interval for saving periodic checkpoints |
 | `--eval-freq` | `25,000` | Step interval for greedy evaluation episodes |
+| `--double-dqn` | off | Double DQN targets |
+| `--save-buffer` / `--no-save-buffer` | on | Save the replay buffer with checkpoints |
+
+> **Note on older runs:** before this was fixed, epsilon was annealed over *gradient updates*, so the
+> `--eps-decay 250000` used for the reported runs actually annealed over ~1.01M env steps. The new
+> default of 1,000,000 env steps reproduces that schedule. Old checkpoints load and resume unchanged.
+
+Under `EpisodicLifeEnv` (e.g. Breakout) a life loss ends the bootstrapped episode, but the logged
+`avg_reward_100` / `avg_length_100` are per full game (clipped rewards). Evaluation runs full games
+and presses FIRE after a lost life (`FireOnLifeLossEnv`) so games like Breakout don't stall.
 
 ---
 
@@ -277,41 +304,48 @@ In single-agent training, the agent optimizes against a **fixed, static program*
 .venv/bin/python3 train_selfplay.py \
     --resume checkpoints_selfplay/latest.pt \
     --additional-steps 500000
+
+# Warm-start from a single-agent model (weights only; epsilon restarts at min(--eps-start, 0.20)):
+.venv/bin/python3 train_selfplay.py \
+    --base-model checkpoints/champion_model.pt \
+    --total-steps 1000000
 ```
 
-### Architectural & Preprocessing Consistency: `train.py` vs. `train_selfplay.py`
+Promotion: every `--eval-freq` steps the learner plays `--eval-matches` (default 20) matches to
+`--eval-target-score` (default 7) against pool snapshots, alternating sides, with 2% epsilon on both
+sides and a step cap. Draws count as half a win. If the win rate reaches `--promotion-threshold`
+(default 65%), the learner's weights are added to the pool. Only the learner's own transitions go
+into the replay buffer.
 
-`train.py` and `train_selfplay.py` are engineered to be **100% consistent across every dimension**, ensuring the **opponent is the only independent variable**:
+The training reward is the 2-player game's own per-player reward, clipped: +1 for a point won,
+−1 for a point lost, and −1 when the player holding the ball fails to serve within ~2 seconds
+(PettingZoo's serve timer: unlike single-player Pong, serving needs FIRE). Each point ends the
+bootstrapped trajectory, while PettingZoo's time-limit cutoff does not.
 
-| Dimension | Single-Agent (`train.py`) | Self-Play (`train_selfplay.py`) | Status |
+### Preprocessing: `train.py` vs. `train_selfplay.py`
+
+All 2-player scripts (`train_selfplay.py`, `pvp_battle.py`, `round_robin_tournament.py`,
+`play_remote.py`) share one pipeline, `src/pong2p.py`, which reproduces `make_atari_env`'s
+preprocessing:
+
+| Dimension | Single-Agent (`train.py`) | 2-player (`src/pong2p.py`) | Same? |
 | :--- | :--- | :--- | :--- |
-| **Neural Network** | Nature 2015 3-Conv + 2-FC (512 units) | Nature 2015 3-Conv + 2-FC (512 units) | **Identical** |
-| **Observation Tensor** | $(4, 84, 84)$ `uint8` stacked grayscale | $(4, 84, 84)$ `uint8` stacked grayscale | **Identical** |
-| **Frame Skipping** | 4-frame skip | 4-frame skip | **Identical** |
-| **Flicker Removal** | 2-frame max pooling (`obs_buffer.max(axis=0)`) | 2-frame max pooling (`obs_buffer.max(axis=0)`) | **Identical** |
-| **Color Normalization** | Native Atari Pong palette (Court 107, Paddles 121, Ball 236) | `remap_pz_to_gym` translates PettingZoo colors to Court 107, Paddles 121, Ball 236 | **Identical** |
-| **Player Perspective** | Paddle is always on Right | Paddle is always on Right (`cv2.flip` for Left player) | **Identical** |
-| **Initial Stochasticity** | 1–30 random NOOPs on reset (`NoopResetEnv`) | 1–30 random NOOPs on match reset | **Identical** |
-| **Replay Buffer** | 100,000 capacity, `uint8` circular array | 100,000 capacity, `uint8` circular array | **Identical** |
-| **Batch Size & LR** | Batch 32, Adam $\eta = 10^{-4}$ | Batch 32, Adam $\eta = 10^{-4}$ | **Identical** |
-| **Double DQN Target** | Online argmax, target net evaluation | Online argmax, target net evaluation | **Identical** |
-| **Huber Loss** | Smooth L1 Loss ($[-1, 1]$ TD error clipping) | Smooth L1 Loss ($[-1, 1]$ TD error clipping) | **Identical** |
-| **Target Sync Interval** | 1,000 steps | 1,000 steps | **Identical** |
-| **Exploration Schedule** | $\epsilon = 1.0 \to 0.02$ over 250,000 steps | $\epsilon = 1.0 \to 0.02$ over 250,000 steps | **Identical** |
-| **Terminal Bootstrapping**| Point loss ends transition (`EpisodicLifeEnv`) | Point loss ends transition (`point_terminal = True`) | **Identical** |
-| **Reward Clipping** | $\{-1, 0, +1\}$ | $\{-1, 0, +1\}$ zero-sum relative score | **Identical** |
-| **Crash & Resume Safety**| Atomic `.tmp` rename, RNG & tracker save | Atomic `.tmp` rename, RNG & tracker save | **Identical** |
-| **The Opponent** | **Deterministic Atari Stella CPU** | **Evolving Snapshot Pool (Fictitious Self-Play)** | **Independent Variable** |
+| Network, observation tensor | Nature CNN, $(4, 84, 84)$ `uint8` | same | Yes |
+| Frame skip / flicker removal | 4, max over last 2 frames | 4, max over last 2 frames | Yes |
+| Color palette | court gray 87, paddles 147/148, ball 236 | identical (PettingZoo renders the same palette, no remap) | Yes |
+| Player perspective | paddle on the right | right paddle as-is, left paddle mirrored with `cv2.flip` | Yes |
+| Reset stochasticity | 1–30 NOOPs | 1–30 NOOPs | Yes |
+| Sticky actions | 0.25 (`Pong-v5` default) | 0.0 (PettingZoo) | **No** |
+| Terminal for bootstrapping | only game end (Pong has no lives) | every point (won or lost) | **No** — Q-value scales differ |
+| Double DQN | off by default | on by default (`--no-double-dqn` to disable) | Configurable |
+| Exploration | 1.0 → 0.02 over 1M env steps | same (0.20 → 0.02 with `--base-model`) | Yes |
+| Opponent | Atari CPU | evolving snapshot pool | Independent variable |
 
-### The Color Palette Domain Shift & Resolution
-
-In PettingZoo `pong_v3` (2-player Atari mode), the Stella emulator switches to Atari Color Scheme #5:
-- **Court**: Brown `[144, 72, 17]` (gray `87`) vs. single-agent olive `[109, 118, 43]` (gray `107`).
-- **Paddles**: Player 1 is Green `[92, 186, 92]` (gray `147`), Player 2 is Orange `[213, 130, 74]` (gray `148`), whereas single-agent paddles are purple-blue `[101, 111, 228]` (gray `121`).
-
-Without correction, a model trained on single-agent Pong fails to register PettingZoo paddles due to out-of-distribution pixel values. `remap_pz_to_gym` surgically maps PettingZoo RGB values back to the exact single-agent colors before grayscale conversion and frame stacking, guaranteeing zero domain shift across both training and PvP arenas.
-
----
+> **Palette note:** an earlier version remapped PettingZoo colors to `(109,118,43)` / `(101,111,228)`.
+> Gym Pong uses that palette only on the single frame returned by `reset()`, which training never sees
+> (it is followed by at least one NOOP), so the remap *introduced* a domain shift. It has been removed.
+> Self-play checkpoints and PvP results produced with the remap (including the committed
+> `checkpoints_selfplay/` run) should be regenerated.
 
 ---
 
@@ -320,8 +354,8 @@ Without correction, a model trained on single-agent Pong fails to register Petti
 At every `--log-freq` steps (e.g., every 1,000 steps), structured metrics are streamed and flushed to disk in `checkpoints/training_metrics.csv`:
 - `step`: Global environment step
 - `episode`: Total completed episodes
-- `avg_reward_100`: Rolling 100-episode average score
-- `avg_length_100`: Rolling 100-episode average episode duration
+- `avg_reward_100`: Rolling 100-game average of the clipped training reward
+- `avg_length_100`: Rolling 100-game average game length (agent steps)
 - `loss`: Bellman Huber TD loss
 - `mean_q`: Average estimated action-value
 - `epsilon`: Current exploration rate
@@ -332,8 +366,9 @@ To plot or compare multiple runs:
 
 ```bash
 .venv/bin/python3 plot_metrics.py \
-    --logs checkpoints/training_metrics.csv \
-    --output learning_curves.png
+    --train-log checkpoints/training_metrics.csv \
+    --eval-log checkpoints/eval_metrics.csv \
+    --output learning_curves.png --no-show
 ```
 
 ---
@@ -343,7 +378,7 @@ To plot or compare multiple runs:
 - **Atomic File Writing**: Checkpoints write to `.tmp` first before an atomic rename (`os.replace`), preventing corrupt files if interrupted mid-write.
 - **Immediate Disk Sync**: The CSV writer calls `os.fsync()` after every log interval so no telemetry is lost if the machine restarts.
 - **Exception Trap**: Unhandled exceptions trigger an emergency checkpoint save before terminating.
-- **SIGINT Trap**: Pressing `Ctrl+C` cleanly saves `latest.pt` and `latest_replay.npz` before exiting.
+- **SIGINT Trap**: Pressing `Ctrl+C` cleanly saves `latest.pt` and `latest_replay.npz` before exiting (both trainers).
 
 ---
 
@@ -368,10 +403,14 @@ Training is fully resumable:
 This restores:
 - Network weights (`online_net` and `target_net`)
 - Optimizer state (Adam momentum & variance)
-- Exact global step counter & episode count
+- Global step counter, gradient-update counter & episode count
 - Epsilon annealing schedule position
-- Replay buffer state (from `latest_replay.npz`) or warm-populates using the loaded policy
-- Graceful shutdown: pressing `Ctrl+C` saves `latest.pt` and `latest_replay.npz` before exiting safely.
+- Best evaluation score and early-stopping patience counter
+- Python/NumPy/Torch RNG states
+- Replay buffer state (from `latest_replay.npz`; a different `--buffer-size` keeps the newest transitions) or warm-populates using the loaded policy
+
+Not restored: the emulator state (a resumed run starts a fresh game) and the ALE's internal RNG,
+so a resumed run is close to, but not bit-identical with, an uninterrupted one.
 
 ---
 
@@ -386,7 +425,7 @@ To eliminate overestimation bias and accelerate convergence to human/superhuman 
     --total-steps 1500000
 ```
 
-To evaluate a saved model checkpoint across 10 full episodes:
+To evaluate a saved model checkpoint across 10 full episodes (add `--epsilon 0.05` for the Nature evaluation protocol):
 
 ```bash
 .venv/bin/python3 evaluate.py \

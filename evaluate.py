@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=10, help="Number of evaluation episodes")
     parser.add_argument("--record-dir", type=str, default="recordings", help="Directory to save evaluation videos")
     parser.add_argument("--record", action="store_true", help="Whether to record video of evaluation")
+    parser.add_argument("--epsilon", type=float, default=0.0, help="Random-action probability during evaluation (Nature 2015 used 0.05)")
     parser.add_argument("--seed", type=int, default=123, help="Random seed")
     return parser.parse_args()
 
@@ -62,7 +63,10 @@ def evaluate(args):
         done = False
 
         while not done:
-            action = agent.select_action(state, deterministic=True)
+            if args.epsilon > 0.0 and np.random.rand() < args.epsilon:
+                action = env.action_space.sample()
+            else:
+                action = agent.select_action(state, deterministic=True)
             next_state, reward, terminated, truncated, _ = env.step(action)
             ep_reward += reward
             ep_length += 1

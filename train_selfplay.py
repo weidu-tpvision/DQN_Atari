@@ -2,17 +2,22 @@
 
 Implements Fictitious Self-Play (FSP) with an evolving Opponent Snapshot Pool:
   1. Learner agent plays against frozen historical snapshots of itself.
-  2. Both sides alternate dynamically (50% Right paddle, 50% Left paddle).
+  2. The learner's side is chosen at random each match (50% Right paddle, 50% Left paddle).
   3. Left player observation is horizontally flipped (cv2.flip) for vision symmetry.
-  4. Both perspectives generate valid zero-sum transitions for the shared replay buffer (2x data efficiency).
-  5. When the learner achieves >= 65% win-rate against the pool, a new snapshot is promoted to the pool.
+  4. Only the learner's own transitions are stored in the replay buffer. The reward is the game's
+     own per-player reward (points, plus PettingZoo's -1 penalty for not serving in time).
+  5. When the learner's win-rate against the pool reaches the promotion threshold, a new
+     snapshot is promoted to the pool.
   6. Atomic checkpointing and graceful shutdown on SIGINT (Ctrl+C).
+
+Preprocessing is shared with every other 2-player script via src/pong2p.py and matches
+train.py (see that module for the remaining differences, e.g. no sticky actions).
 
 Usage:
     # Train self-play from scratch:
     python train_selfplay.py --total-steps 500000
 
-    # Train self-play initialized from an existing Pong checkpoint:
+    # Train self-play initialized from an existing Pong checkpoint (weights only):
     python train_selfplay.py --base-model checkpoints/champion_model.pt --total-steps 500000
 """
 
@@ -20,44 +25,19 @@ import os
 import sys
 import time
 import glob
+import json
 import random
 import signal
 import argparse
-from collections import deque
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict
 
 import numpy as np
-import cv2
 import torch
 
-os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-
-from pettingzoo.atari import pong_v3
 from src.agent import DQNAgent
+from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
 from src.replay_buffer import ReplayBuffer
 from src.utils import set_seed, get_device, MetricTracker
-
-
-def remap_pz_to_gym(pz_rgb: np.ndarray) -> np.ndarray:
-    """Remap PettingZoo Pong 2P color palette to match standard Gymnasium ALE/Pong-v5."""
-    gym_rgb = pz_rgb.copy()
-    bg_mask = np.all(pz_rgb == [144, 72, 17], axis=-1)
-    r_mask = np.all(pz_rgb == [92, 186, 92], axis=-1)
-    l_mask = np.all(pz_rgb == [213, 130, 74], axis=-1)
-    gym_rgb[bg_mask] = [109, 118, 43]
-    gym_rgb[r_mask] = [101, 111, 228]
-    gym_rgb[l_mask] = [101, 111, 228]
-    return gym_rgb
-
-
-def process_frame(rgb: np.ndarray, flip: bool = False) -> np.ndarray:
-    """Preprocess 210x160 RGB frame to 84x84 grayscale matching ALE/Pong-v5."""
-    remapped = remap_pz_to_gym(rgb)
-    gray = cv2.cvtColor(remapped, cv2.COLOR_RGB2GRAY)
-    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
-    if flip:
-        resized = cv2.flip(resized, 1)
-    return resized
 
 
 class SnapshotPool:
@@ -71,10 +51,10 @@ class SnapshotPool:
         self.loaded_agents: Dict[str, DQNAgent] = {}
 
     def add_snapshot(self, agent: DQNAgent, step: int) -> str:
-        """Save a new snapshot of the learner agent into the pool."""
+        """Save the learner's current weights into the pool."""
         idx = len(self.snapshots)
         path = os.path.join(self.pool_dir, f"snapshot_{idx:03d}_step_{step}.pt")
-        agent.save(path)
+        agent.save_weights(path)
         self.snapshots.append(path)
         print(f"\n[POOL PROMOTION] Added new snapshot to pool: {os.path.basename(path)} (Total Pool Size: {len(self.snapshots)})")
         return path
@@ -89,10 +69,10 @@ class SnapshotPool:
         else:
             chosen_path = self.snapshots[-1]
 
-        # Cache loaded agents in RAM for fast switching
+        # Cache loaded agents for fast switching
         if chosen_path not in self.loaded_agents:
-            opp = DQNAgent(num_actions=6, device=self.device)
-            opp.load(chosen_path)
+            opp = DQNAgent(num_actions=NUM_ACTIONS, device=self.device)
+            opp.load_weights(chosen_path)
             opp.online_net.eval()
             self.loaded_agents[chosen_path] = opp
 
@@ -102,74 +82,40 @@ class SnapshotPool:
 def evaluate_learner_vs_pool(
     learner: DQNAgent,
     pool: SnapshotPool,
-    num_matches: int = 6,
+    num_matches: int = 20,
     target_score: int = 7,
-    device: torch.device = torch.device("cpu"),
+    epsilon: float = 0.02,
+    max_steps: int = 10_000,
+    seed: int = 5000,
 ) -> Dict[str, float]:
-    """Evaluate learner against random snapshots from the pool with side alternation."""
-    env = pong_v3.parallel_env(render_mode="rgb_array")
+    """Evaluate learner against random snapshots from the pool with side alternation.
+
+    Both sides play greedily with a small epsilon so two deterministic policies can't lock
+    into an endless rally; `max_steps` caps each match. Drawn matches count as half a win.
+    """
+    game = TwoPlayerPong()
     wins = 0
+    draws = 0
     total_pts_for = 0
     total_pts_against = 0
-    obs_buffer = np.zeros((2, 210, 160, 3), dtype=np.uint8)
 
     for m in range(num_matches):
         opp_agent, _ = pool.sample_opponent()
         learner_is_right = (m % 2 == 0)
-
         right_agent = learner if learner_is_right else opp_agent
         left_agent = opp_agent if learner_is_right else learner
 
-        obs, _ = env.reset(seed=5000 + m)
-        # Random noop reset (1-30 frames) matching Nature 2015 NoopResetEnv
-        noops = random.randint(1, 30)
-        for _ in range(noops):
-            obs, _, term, trunc, _ = env.step({"first_0": 0, "second_0": 0})
-            if term["first_0"] or trunc["first_0"] or term["second_0"] or trunc["second_0"]:
-                obs, _ = env.reset()
-                break
-
-        right_stack = deque([process_frame(obs["first_0"], flip=False)] * 4, maxlen=4)
-        left_stack = deque([process_frame(obs["second_0"], flip=True)] * 4, maxlen=4)
-
+        s_r, s_l = game.reset(seed=seed + m)
         r_pts, l_pts = 0, 0
-        done = False
-
-        while not done:
-            # Greedy actions for evaluation
-            s_r = torch.as_tensor(np.array(right_stack), device=device).unsqueeze(0)
-            s_l = torch.as_tensor(np.array(left_stack), device=device).unsqueeze(0)
-            with torch.no_grad():
-                a_r = int(right_agent.online_net(s_r).argmax(dim=1).item())
-                a_l = int(left_agent.online_net(s_l).argmax(dim=1).item())
-
-            # 4-frame skip with 2-frame max-pooling
-            r_gain, l_gain = 0, 0
-            for i in range(4):
-                obs, rewards, term, trunc, _ = env.step({"first_0": a_r, "second_0": a_l})
-                if rewards["first_0"] > 0:
-                    r_gain += int(rewards["first_0"])
-                if rewards["second_0"] > 0:
-                    l_gain += int(rewards["second_0"])
-
-                if i == 2:
-                    obs_buffer[0] = obs["first_0"]
-                elif i == 3:
-                    obs_buffer[1] = obs["first_0"]
-
-                if term["first_0"] or trunc["first_0"] or term["second_0"] or trunc["second_0"]:
-                    done = True
-                    break
-
+        for _ in range(max_steps):
+            a_r = policy_action(right_agent, s_r, epsilon)
+            a_l = policy_action(left_agent, s_l, epsilon)
+            r_gain, l_gain, done = game.step(a_r, a_l)
             r_pts += r_gain
             l_pts += l_gain
-
-            pooled_rgb = obs_buffer.max(axis=0)
-            right_stack.append(process_frame(pooled_rgb, flip=False))
-            left_stack.append(process_frame(pooled_rgb, flip=True))
-
-            if r_pts >= target_score or l_pts >= target_score:
-                done = True
+            s_r, s_l = game.observe()
+            if done or r_pts >= target_score or l_pts >= target_score:
+                break
 
         learner_pts = r_pts if learner_is_right else l_pts
         opp_pts = l_pts if learner_is_right else r_pts
@@ -177,11 +123,14 @@ def evaluate_learner_vs_pool(
         total_pts_against += opp_pts
         if learner_pts > opp_pts:
             wins += 1
+        elif learner_pts == opp_pts:
+            draws += 1
 
-    env.close()
+    game.close()
     return {
-        "win_rate": float(wins / num_matches * 100.0),
+        "win_rate": float((wins + 0.5 * draws) / num_matches * 100.0),
         "wins": wins,
+        "draws": draws,
         "matches": num_matches,
         "pts_for": total_pts_for,
         "pts_against": total_pts_against,
@@ -192,25 +141,27 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Self-Play DQN Training for Atari Pong")
     parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total environment interaction steps")
     parser.add_argument("--additional-steps", type=int, default=None, help="Train for an additional N steps from checkpoint")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume self-play from")
-    parser.add_argument("--base-model", type=str, default=None, help="Optional existing checkpoint to initialize learner")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (or directory with latest.pt) to resume self-play from")
+    parser.add_argument("--base-model", type=str, default=None, help="Optional existing checkpoint whose weights initialize the learner")
     parser.add_argument("--buffer-size", type=int, default=100_000, help="Replay buffer capacity")
     parser.add_argument("--replay-start-size", type=int, default=10_000, help="Warm-up steps before SGD starts")
     parser.add_argument("--batch-size", type=int, default=32, help="Minibatch size for SGD")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (Adam)")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--eps-start", type=float, default=1.0, help="Initial exploration rate (or 0.15 if base-model)")
+    parser.add_argument("--eps-start", type=float, default=1.0, help="Initial exploration rate (capped at 0.20 with --base-model)")
     parser.add_argument("--eps-end", type=float, default=0.02, help="Final exploration rate")
-    parser.add_argument("--eps-decay", type=int, default=250_000, help="Steps to decay epsilon")
-    parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Target network update frequency")
+    parser.add_argument("--eps-decay", type=int, default=1_000_000, help="Environment steps to anneal epsilon from start to end")
+    parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Gradient updates between target network syncs")
     parser.add_argument("--train-freq", type=int, default=4, help="Environment steps between gradient updates")
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving periodic checkpoints")
     parser.add_argument("--eval-freq", type=int, default=25_000, help="Step interval to evaluate vs pool and promote")
+    parser.add_argument("--eval-matches", type=int, default=20, help="Matches per pool evaluation (more = less noisy promotion)")
+    parser.add_argument("--eval-target-score", type=int, default=7, help="Points needed to win an evaluation match")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
     parser.add_argument("--promotion-threshold", type=float, default=65.0, help="Win rate %% needed to add snapshot to pool")
     parser.add_argument("--save-dir", type=str, default="checkpoints_selfplay", help="Directory to save selfplay data")
-    parser.add_argument("--save-buffer", action="store_true", default=True, help="Whether to save replay buffer on checkpoints")
-    parser.add_argument("--double-dqn", action="store_true", default=True, help="Enable Double DQN target calculation")
+    parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
+    parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=True, help="Double DQN target calculation")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
 
@@ -237,7 +188,7 @@ def main():
     # Initialize Learner
     eps_start = args.eps_start if not args.base_model else min(args.eps_start, 0.20)
     learner = DQNAgent(
-        num_actions=6,
+        num_actions=NUM_ACTIONS,
         in_channels=4,
         gamma=args.gamma,
         lr=args.lr,
@@ -249,9 +200,12 @@ def main():
         device=device,
     )
 
-    if args.base_model and os.path.exists(args.base_model):
-        print(f"Loading initial policy from base model: {args.base_model}")
-        learner.load(args.base_model)
+    if args.base_model and not args.resume:
+        if not os.path.exists(args.base_model):
+            sys.exit(f"Base model not found: {args.base_model}")
+        # Weights only: keep a fresh optimizer and counters so the epsilon schedule starts at eps_start
+        print(f"Loading initial policy weights from base model: {args.base_model}")
+        learner.load_weights(args.base_model)
 
     # Initialize Pool
     pool = SnapshotPool(pool_dir=pool_dir, device=device)
@@ -266,35 +220,7 @@ def main():
         device=device,
     )
 
-    # Logging setup
-    log_file_path = os.path.join(args.save_dir, "selfplay_training.log")
-    log_file = open(log_file_path, "a", buffering=1)
-
-    metrics_path = os.path.join(args.save_dir, "selfplay_metrics.csv")
-    csv_exists = os.path.exists(metrics_path) and os.path.getsize(metrics_path) > 0
-    csv_file = open(metrics_path, "a", buffering=1)
-    if not csv_exists:
-        csv_file.write("step,matches_played,win_rate_vs_pool,pool_size,loss,mean_q,epsilon,fps,elapsed_seconds\n")
-        csv_file.flush()
-
-    step_csv_path = os.path.join(args.save_dir, "selfplay_step_metrics.csv")
-    step_csv_exists = os.path.exists(step_csv_path) and os.path.getsize(step_csv_path) > 0
-    step_csv_file = open(step_csv_path, "a", buffering=1)
-    if not step_csv_exists:
-        step_csv_file.write("step,matches_played,pool_size,loss,mean_q,epsilon,fps,elapsed_seconds\n")
-        step_csv_file.flush()
-
-    interrupted = False
-    def sigint_handler(signum, frame):
-        nonlocal interrupted
-        print("\n[Interrupt] Caught signal! Saving self-play state before exit...", flush=True)
-        interrupted = True
-
-    signal.signal(signal.SIGINT, sigint_handler)
-
-    env = pong_v3.parallel_env(render_mode="rgb_array")
     tracker = MetricTracker(window_size=100)
-
     global_step = 0
     matches_played = 0
 
@@ -304,13 +230,13 @@ def main():
         if os.path.isdir(resume_path):
             resume_path = os.path.join(resume_path, "latest.pt")
         print(f"\n--> Resuming Self-Play training from checkpoint: {resume_path}")
+        # load() restores env_steps (epsilon schedule) and num_updates (target sync) as saved
         ckpt = learner.load(resume_path)
-        global_step = ckpt.get("global_step", ckpt.get("total_steps", 0))
+        global_step = ckpt.get("global_step", 0)
         matches_played = ckpt.get("matches_played", 0)
-        learner.total_steps = global_step
 
         if "tracker_history" in ckpt:
-            tracker.history = ckpt["tracker_history"]
+            tracker.load(ckpt["tracker_history"])
 
         if "rng_state" in ckpt:
             rng = ckpt["rng_state"]
@@ -348,14 +274,47 @@ def main():
         print(f"[INFO] Current step ({global_step:,}) already meets or exceeds target steps ({target_total_steps:,}).")
         return
 
+    # Logging setup
+    log_file = open(os.path.join(args.save_dir, "selfplay_training.log"), "a", buffering=1)
+    log_file.write(f"Config: {json.dumps(vars(args))}\n")
+
+    metrics_path = os.path.join(args.save_dir, "selfplay_metrics.csv")
+    csv_exists = os.path.exists(metrics_path) and os.path.getsize(metrics_path) > 0
+    csv_file = open(metrics_path, "a", buffering=1)
+    if not csv_exists:
+        csv_file.write("step,matches_played,win_rate_vs_pool,pool_size,loss,mean_q,epsilon,fps,elapsed_seconds\n")
+        csv_file.flush()
+
+    step_csv_path = os.path.join(args.save_dir, "selfplay_step_metrics.csv")
+    step_csv_exists = os.path.exists(step_csv_path) and os.path.getsize(step_csv_path) > 0
+    step_csv_file = open(step_csv_path, "a", buffering=1)
+    if not step_csv_exists:
+        step_csv_file.write("step,matches_played,pool_size,loss,mean_q,epsilon,fps,elapsed_seconds\n")
+        step_csv_file.flush()
+
+    def close_files():
+        log_file.close()
+        csv_file.close()
+        step_csv_file.close()
+
+    interrupted = False
+    def sigint_handler(signum, frame):
+        nonlocal interrupted
+        print("\n[Interrupt] Caught signal! Saving self-play state before exit...", flush=True)
+        interrupted = True
+
+    signal.signal(signal.SIGINT, sigint_handler)
+
+    game = TwoPlayerPong()
+
     # Checkpoint helper function
     def save_checkpoint(step_num: int, is_latest: bool = False):
         extra = {
             "global_step": step_num,
             "matches_played": matches_played,
             "pool_size": len(pool.snapshots),
-            "total_steps": learner.total_steps,
             "tracker_history": tracker.history,
+            "config": vars(args),
             "rng_state": {
                 "python": random.getstate(),
                 "numpy": np.random.get_state(),
@@ -375,11 +334,8 @@ def main():
         else:
             print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
 
-    # Match state
     t0 = time.time()
-
-    # Pre-allocate obs buffers for max-pooling frame skip
-    obs_buffer = np.zeros((2, 210, 160, 3), dtype=np.uint8)
+    session_start_step = global_step
 
     try:
         while global_step < target_total_steps and not interrupted:
@@ -387,87 +343,44 @@ def main():
             opp_agent, opp_label = pool.sample_opponent()
             learner_is_right = (random.random() < 0.5)
 
-            obs, _ = env.reset(seed=args.seed + matches_played)
-            # Random no-op reset (1-30 frames) matching Nature 2015 NoopResetEnv
-            noops = random.randint(1, 30)
-            for _ in range(noops):
-                obs, _, term, trunc, _ = env.step({"first_0": 0, "second_0": 0})
-                if term["first_0"] or trunc["first_0"] or term["second_0"] or trunc["second_0"]:
-                    obs, _ = env.reset()
-                    break
-
-            right_stack = deque([process_frame(obs["first_0"], flip=False)] * 4, maxlen=4)
-            left_stack = deque([process_frame(obs["second_0"], flip=True)] * 4, maxlen=4)
-
+            s_r, s_l = game.reset(seed=args.seed + matches_played)
             match_done = False
             r_pts, l_pts = 0, 0
 
             while not match_done and global_step < target_total_steps and not interrupted:
                 global_step += 1
-                if interrupted:
-                    save_checkpoint(global_step, is_latest=True)
-                    print("Checkpoint saved successfully. Exiting gracefully.", flush=True)
-                    sys.exit(0)
+                learner.env_steps = global_step
 
-                # Determine actions
-                s_r = np.array(right_stack)
-                s_l = np.array(left_stack)
-
+                # Learner explores with its schedule; the opponent plays greedily with 5% noise
+                # to avoid deterministic cycles
                 if learner_is_right:
                     a_r = learner.select_action(s_r, deterministic=False)
-                    # Opponent plays epsilon-greedy with light exploration (0.05) to avoid deterministic cycles
-                    a_l = opp_agent.select_action(s_l, deterministic=(random.random() > 0.05))
+                    a_l = policy_action(opp_agent, s_l, epsilon=0.05)
                 else:
                     a_l = learner.select_action(s_l, deterministic=False)
-                    a_r = opp_agent.select_action(s_r, deterministic=(random.random() > 0.05))
+                    a_r = policy_action(opp_agent, s_r, epsilon=0.05)
 
-                # Step environment with 4-frame skip and 2-frame max pooling
-                r_gain, l_gain = 0, 0
-                for i in range(4):
-                    obs, rewards, term, trunc, _ = env.step({"first_0": a_r, "second_0": a_l})
-                    if rewards["first_0"] > 0:
-                        r_gain += int(rewards["first_0"])
-                    if rewards["second_0"] > 0:
-                        l_gain += int(rewards["second_0"])
-
-                    if i == 2:
-                        obs_buffer[0] = obs["first_0"]
-                    elif i == 3:
-                        obs_buffer[1] = obs["first_0"]
-
-                    if term["first_0"] or trunc["first_0"] or term["second_0"] or trunc["second_0"]:
-                        if i < 2:
-                            obs_buffer[0] = obs["first_0"]
-                            obs_buffer[1] = obs["first_0"]
-                        elif i == 2:
-                            obs_buffer[1] = obs["first_0"]
-                        match_done = True
-                        break
-
+                r_gain, l_gain, game_over = game.step(a_r, a_l)
                 r_pts += r_gain
                 l_pts += l_gain
+                match_done = game_over or r_pts >= 21 or l_pts >= 21
+                next_s_r, next_s_l = game.observe()
 
-                # Max-pooled frame for right player, flipped for left player
-                pooled_rgb = obs_buffer.max(axis=0)
-                next_r_frame = process_frame(pooled_rgb, flip=False)
-                next_l_frame = process_frame(pooled_rgb, flip=True)
+                # Clipped raw game reward per player: +1 point won, -1 point lost, and -1 when the
+                # player holding the ball fails to serve in time (PettingZoo's serve timer)
+                r_rew = float(np.sign(game.right_reward))
+                l_rew = float(np.sign(game.left_reward))
 
-                next_s_r = np.array(list(right_stack)[1:] + [next_r_frame])
-                next_s_l = np.array(list(left_stack)[1:] + [next_l_frame])
-
-                # Zero-sum clipped rewards for both perspectives
-                r_rew = float(np.sign(r_gain - l_gain))
-                l_rew = float(np.sign(l_gain - r_gain))
-
-                # Push transitions to replay buffer (learner perspective)
-                point_terminal = (r_gain > 0 or l_gain > 0 or match_done)
+                # Every point (won or lost) ends the bootstrapped trajectory, as does game over.
+                # A PettingZoo time-limit cutoff is not a real ending, so it still bootstraps.
+                game_ended = match_done and not game.truncated
+                point_terminal = (r_gain > 0 or l_gain > 0 or game_ended)
                 if learner_is_right:
                     replay_buffer.push(s_r, a_r, r_rew, next_s_r, point_terminal)
                 else:
                     replay_buffer.push(s_l, a_l, l_rew, next_s_l, point_terminal)
 
-                right_stack.append(next_r_frame)
-                left_stack.append(next_l_frame)
+                s_r, s_l = next_s_r, next_s_l
 
                 # Gradient Descent Update
                 if len(replay_buffer) >= args.replay_start_size and global_step % args.train_freq == 0:
@@ -478,7 +391,7 @@ def main():
                 # Periodic Console Logging
                 if global_step % args.log_freq == 0:
                     elapsed = time.time() - t0
-                    fps = global_step / max(1.0, elapsed)
+                    fps = (global_step - session_start_step) / max(1.0, elapsed)
                     loss_val = tracker.mean("loss")
                     q_val = tracker.mean("mean_q")
                     eps_val = learner.get_epsilon()
@@ -489,25 +402,28 @@ def main():
                     )
                     print(log_str, flush=True)
                     log_file.write(log_str + "\n")
-                    log_file.flush()
 
                     step_csv_file.write(
                         f"{global_step},{matches_played},{len(pool.snapshots)},"
                         f"{loss_val:.6f},{q_val:.4f},{eps_val:.4f},{fps:.1f},{elapsed:.1f}\n"
                     )
-                    step_csv_file.flush()
 
                 # Periodic Evaluation & Pool Promotion
                 if global_step % args.eval_freq == 0 and len(replay_buffer) >= args.replay_start_size:
-                    eval_res = evaluate_learner_vs_pool(learner, pool, num_matches=6, target_score=7, device=device)
+                    eval_res = evaluate_learner_vs_pool(
+                        learner, pool,
+                        num_matches=args.eval_matches,
+                        target_score=args.eval_target_score,
+                        seed=args.seed * 1000 + global_step,
+                    )
                     eval_str = (
                         f"\n>>> [SELF-PLAY EVAL @ Step {global_step:7d}] "
-                        f"Win-Rate vs Pool: {eval_res['win_rate']:5.1f}% ({eval_res['wins']}/{eval_res['matches']}) | "
+                        f"Win-Rate vs Pool: {eval_res['win_rate']:5.1f}% "
+                        f"({eval_res['wins']}W/{eval_res['draws']}D of {eval_res['matches']}) | "
                         f"Score: {eval_res['pts_for']}-{eval_res['pts_against']}\n"
                     )
                     print(eval_str, flush=True)
                     log_file.write(eval_str + "\n")
-                    log_file.flush()
 
                     # Check for promotion to pool
                     if eval_res["win_rate"] >= args.promotion_threshold:
@@ -517,41 +433,37 @@ def main():
                     save_checkpoint(global_step, is_latest=True)
 
                     elapsed = time.time() - t0
-                    fps = global_step / max(1.0, elapsed)
+                    fps = (global_step - session_start_step) / max(1.0, elapsed)
                     csv_file.write(
                         f"{global_step},{matches_played},{eval_res['win_rate']:.2f},"
                         f"{len(pool.snapshots)},{tracker.mean('loss'):.6f},{tracker.mean('mean_q'):.4f},"
                         f"{learner.get_epsilon():.4f},{fps:.1f},{elapsed:.1f}\n"
                     )
-                    csv_file.flush()
 
                 # Periodic Checkpointing
                 if global_step % args.save_freq == 0:
                     save_checkpoint(global_step, is_latest=True)
                     save_checkpoint(global_step, is_latest=False)
 
-                if r_pts >= 21 or l_pts >= 21:
-                    match_done = True
-
     except Exception as e:
         print(f"\n[CRASH DETECTED] Unhandled exception occurred at Step {global_step}: {e}", flush=True)
         print("Saving emergency recovery checkpoint before exit...", flush=True)
         save_checkpoint(global_step, is_latest=True)
-        log_file.close()
-        csv_file.close()
-        step_csv_file.close()
-        env.close()
-        raise e
+        close_files()
+        game.close()
+        raise
 
-    # Final cleanup & save
     save_checkpoint(global_step, is_latest=True)
+    game.close()
+    if interrupted:
+        print("Checkpoint saved successfully. Exiting gracefully.", flush=True)
+        close_files()
+        sys.exit(0)
+
     final_path = os.path.join(args.save_dir, "selfplay_final.pt")
     learner.save(final_path, {"global_step": global_step, "matches_played": matches_played})
     print(f"\n[DONE] Self-Play training concluded at step {global_step:,}. Final model saved to {final_path}")
-    log_file.close()
-    csv_file.close()
-    step_csv_file.close()
-    env.close()
+    close_files()
 
 
 if __name__ == "__main__":

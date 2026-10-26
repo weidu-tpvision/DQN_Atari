@@ -2,12 +2,19 @@
 
 Manages:
 - Online Network Q(s, a; θ) and Target Network Q(s, a; θ^-)
-- Epsilon-greedy action selection with linear decay
+- Epsilon-greedy action selection with linear decay over environment steps
 - Bellman loss computation with Huber Loss (Smooth L1)
-- Periodic target network weight synchronization
+- Periodic target network weight synchronization (every C gradient updates)
+
+Counters:
+- `env_steps`: environment (agent) steps taken so far. Drives the epsilon schedule and is
+  set by the training loop each step. Nature 2015 anneals epsilon over agent steps.
+- `num_updates`: gradient updates performed so far. Drives target network syncs. Nature 2015
+  measures the target update frequency C in parameter updates.
 """
 
-from typing import Tuple, Dict, Any
+import os
+from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,7 +33,7 @@ class DQNAgent:
         eps_start: float = 1.0,
         eps_end: float = 0.02,
         eps_decay_steps: int = 1_000_000,
-        target_sync_freq: int = 10_000,
+        target_sync_freq: int = 1_000,
         double_dqn: bool = False,
         device: torch.device = torch.device("cpu"),
     ):
@@ -42,7 +49,7 @@ class DQNAgent:
         # Online network: updated at every train step
         self.online_net = NatureDQN(in_channels=in_channels, num_actions=num_actions).to(device)
 
-        # Target network: frozen parameters θ^-, synchronized periodically every C steps
+        # Target network: frozen parameters θ^-, synchronized every `target_sync_freq` updates
         self.target_net = NatureDQN(in_channels=in_channels, num_actions=num_actions).to(device)
         self.sync_target_network()
         self.target_net.eval()
@@ -53,26 +60,27 @@ class DQNAgent:
         # Huber loss matches the [-1, 1] gradient clipping used in Mnih et al. (2015)
         self.loss_fn = nn.SmoothL1Loss()
 
-        self.total_steps = 0
+        self.env_steps = 0
+        self.num_updates = 0
 
     def get_epsilon(self) -> float:
-        """Calculate current epsilon using linear annealing schedule."""
-        fraction = min(1.0, self.total_steps / float(self.eps_decay_steps))
+        """Linear annealing from eps_start to eps_end over `eps_decay_steps` environment steps."""
+        fraction = min(1.0, self.env_steps / float(self.eps_decay_steps))
         return self.eps_start + fraction * (self.eps_end - self.eps_start)
 
     def select_action(self, state: np.ndarray, deterministic: bool = False) -> int:
         """Select action via epsilon-greedy policy.
-        
+
         Args:
             state: Array of shape (4, 84, 84) (uint8).
             deterministic: If True, always select greedy action (for evaluation).
-            
+
         Returns:
             Action index (int).
         """
         epsilon = 0.0 if deterministic else self.get_epsilon()
 
-        if np.random.rand() < epsilon:
+        if epsilon > 0.0 and np.random.rand() < epsilon:
             return np.random.randint(self.num_actions)
 
         # Greedy action via Q-network
@@ -90,14 +98,14 @@ class DQNAgent:
         dones: torch.Tensor,
     ) -> Dict[str, float]:
         """Perform one step of gradient descent on a sampled minibatch.
-        
+
         Args:
             states: (batch_size, 4, 84, 84)
             actions: (batch_size,)
             rewards: (batch_size,)
             next_states: (batch_size, 4, 84, 84)
             dones: (batch_size,)
-            
+
         Returns:
             Dictionary with training metrics (loss, mean_q).
         """
@@ -128,8 +136,8 @@ class DQNAgent:
         self.optimizer.step()
 
         # 5. Periodic target network update
-        self.total_steps += 1
-        if self.total_steps % self.target_sync_freq == 0:
+        self.num_updates += 1
+        if self.num_updates % self.target_sync_freq == 0:
             self.sync_target_network()
 
         return {
@@ -148,21 +156,37 @@ class DQNAgent:
             "online_net": self.online_net.state_dict(),
             "target_net": self.target_net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-            "total_steps": self.total_steps,
+            "env_steps": self.env_steps,
+            "num_updates": self.num_updates,
         }
         if extra_state:
             checkpoint.update(extra_state)
-        
-        import os
+
         tmp_path = path + ".tmp"
         torch.save(checkpoint, tmp_path)
         os.replace(tmp_path, path)
 
+    def save_weights(self, path: str) -> None:
+        """Save only the online network weights (small, loadable with weights_only=True)."""
+        tmp_path = path + ".tmp"
+        torch.save({"online_net": self.online_net.state_dict()}, tmp_path)
+        os.replace(tmp_path, path)
+
     def load(self, path: str) -> dict:
-        """Load model checkpoint and return checkpoint dict for resumption."""
+        """Load full training state (weights, optimizer, counters) and return the checkpoint dict."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.online_net.load_state_dict(checkpoint["online_net"])
-        self.target_net.load_state_dict(checkpoint["target_net"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.total_steps = checkpoint.get("total_steps", 0)
+        self.target_net.load_state_dict(checkpoint.get("target_net", checkpoint["online_net"]))
+        if "optimizer" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+        # Older checkpoints stored the update count as "total_steps" and the env step as "global_step"
+        self.num_updates = checkpoint.get("num_updates", checkpoint.get("total_steps", 0))
+        self.env_steps = checkpoint.get("env_steps", checkpoint.get("global_step", 0))
         return checkpoint
+
+    def load_weights(self, path: str) -> None:
+        """Load only network weights (fresh optimizer and counters), e.g. to warm-start or to play."""
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        state_dict = checkpoint["online_net"] if "online_net" in checkpoint else checkpoint
+        self.online_net.load_state_dict(state_dict)
+        self.sync_target_network()

@@ -1,5 +1,11 @@
 # Detailed Implementation Plan: Deep Q-Networks (DQN) for Atari (Nature 2015)
 
+> **Status:** original pre-implementation design document, kept for reference. Where it differs from
+> the code, the code and `README.md` (see "Deviations from the Nature 2015 setup") are authoritative.
+> Notably: the replay buffer stores full 4-frame stacks rather than the shared-frame ring buffer of
+> §3.3, the environment is `ALE/Pong-v5` with sticky actions, and the 2-player/self-play tooling is
+> not covered here.
+
 ## 1. Executive Summary & Objective
 
 This project implements the foundational Deep Reinforcement Learning algorithm introduced by Google DeepMind in the landmark Nature 2015 paper:
@@ -79,7 +85,7 @@ Standard Atari games run at $210 \times 160$ RGB at 60Hz. The canonical Atari pr
 
 ### 3.3 Memory-Efficient Experience Replay Buffer
 - **Naive approach**: Storing $(s, a, r, s')$ where $s, s'$ are 4-frame float32 tensors consumes $\sim 28 \text{ GB}$ of RAM for $10^6$ frames, which can trigger out-of-memory crashes.
-- **Optimized approach**: Store individual frames as `np.uint8` in a circular ring buffer ($84 \times 84 \times 1$). Transitions share consecutive frames, reducing memory to $\approx 7 \text{ GB}$ for $10^6$ frames or $\approx 700 \text{ MB}$ for $10^5$ frames. Frames are only converted to float32 and normalized on the GPU during mini-batch sampling.
+- **Optimized approach** (not implemented yet): Store individual frames as `np.uint8` in a circular ring buffer ($84 \times 84 \times 1$). Transitions share consecutive frames, reducing memory to $\approx 7 \text{ GB}$ for $10^6$ frames or $\approx 700 \text{ MB}$ for $10^5$ frames. Frames are only converted to float32 and normalized on the GPU during mini-batch sampling.
 
 ---
 
@@ -90,13 +96,13 @@ Standard Atari games run at $210 \times 160$ RGB at 60Hz. The canonical Atari pr
 | **Minibatch size** | $32$ | Standard size |
 | **Replay memory size** | $1,000,000$ | Scaled to $100,000$ - $300,000$ for rapid testing |
 | **Agent history length** | $4$ | 4 stacked frames |
-| **Target network update freq ($C$)** | $10,000$ steps | Hard update: $\theta^- \leftarrow \theta$ every $C$ frames |
+| **Target network update freq ($C$)** | $10,000$ parameter updates | Hard update: $\theta^- \leftarrow \theta$ every $C$ gradient updates |
 | **Discount factor ($\gamma$)** | $0.99$ | Standard RL discount |
 | **Action repeat / skip ($k$)** | $4$ | Frame skipping |
 | **Update frequency** | Every $4$ steps | Train step performed every 4 agent steps |
 | **Initial exploration ($\epsilon_{start}$)** | $1.0$ | Random exploratory actions |
 | **Final exploration ($\epsilon_{end}$)** | $0.1$ or $0.02$ | Purely greedy / minimal exploration |
-| **Exploration decay duration** | $1,000,000$ frames | Linear schedule |
+| **Exploration decay duration** | $1,000,000$ agent steps | Linear schedule |
 | **Replay start size** | $50,000$ steps | Collect random transitions before training |
 | **Optimizer** | RMSprop / Adam | Paper used RMSprop; Adam ($lr=1e-4$) converges faster |
 | **Loss** | Huber Loss | Smooth L1 loss ($\delta=1.0$) |
@@ -133,7 +139,7 @@ atari/
 1. Create virtual environment `.venv/`.
 2. Install required packages:
    - `torch`, `torchvision` (CUDA-enabled)
-   - `gymnasium[atari]`, `gymnasium[accept-rom-license]`, `ale-py`
+   - `gymnasium[atari]`, `ale-py` (ROMs ship with `ale-py >= 0.9`)
    - `opencv-python`, `numpy`, `matplotlib`
 3. Generate `requirements.txt`.
 
@@ -144,7 +150,7 @@ atari/
 4. **`agent.py`**: Implement `DQNAgent` managing $\theta$ and $\theta^-$, $\epsilon$-greedy schedule, and Bellman target computations.
 
 ### Phase 3: Unit Testing & Integrity Checks
-1. Test wrapper pipeline on `ALE/Pong-v5` to verify $(4, 84, 84)$ float tensors in $[0, 1]$.
+1. Test wrapper pipeline on `ALE/Pong-v5` to verify $(4, 84, 84)$ `uint8` observations (normalized to $[0, 1]$ inside the model).
 2. Test model forward pass with dummy batches.
 3. Test replay buffer push and sample operations for consistency.
 

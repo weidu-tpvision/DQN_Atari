@@ -10,15 +10,19 @@ Supports two interactive modes:
        [Q] or [ESC]:         Quit
 
   2. Web Browser Remote Control Mode (--mode web):
-     Opens a local web server (http://localhost:8080).
-     Play in any web browser with live 60 FPS video stream and interactive remote control buttons / keyboard!
+     Opens a web server (default http://127.0.0.1:8080, use --host 0.0.0.0 to accept
+     connections from other machines; there is no authentication).
+     Play in any web browser with a live ~40 FPS video stream and interactive buttons / keyboard!
 
 Usage:
     # Desktop X11 window:
     python play_remote.py --mode x11
 
-    # Web browser remote control:
+    # Web browser remote control (local, or via `ssh -L 8080:localhost:8080 host`):
     python play_remote.py --mode web --port 8080
+
+    # Web browser remote control reachable from the LAN:
+    python play_remote.py --mode web --host 0.0.0.0 --port 8080
 """
 
 import os
@@ -29,24 +33,17 @@ import threading
 import numpy as np
 import cv2
 import torch
-from collections import deque
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-
-from pettingzoo.atari import pong_v3
 from src.agent import DQNAgent
+from src.pong2p import TwoPlayerPong, NUM_ACTIONS
 from src.utils import get_device
 
-
-def process_frame(rgb: np.ndarray, flip: bool = False) -> np.ndarray:
-    """Preprocess 210x160 RGB into 84x84 grayscale."""
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
-    if flip:
-        resized = cv2.flip(resized, 1)
-    return resized
+# Human actions accepted from the browser: 0: NOOP, 1: FIRE, 2: UP, 3: DOWN
+VALID_HUMAN_ACTIONS = {0, 1, 2, 3}
+# The page re-sends a held action every 100 ms; release to NOOP if nothing arrives for this long
+ACTION_TIMEOUT_S = 0.3
 
 
 # Global state for web mode
@@ -54,15 +51,9 @@ class GameServerState:
     def __init__(self):
         self.lock = threading.Lock()
         self.current_frame = None
-        self.human_action = 0  # 0: NOOP, 1: FIRE, 2: UP, 3: DOWN
+        self.human_action = 0
         self.last_action_time = 0
-        self.human_pts = 0
-        self.ai_pts = 0
-        self.matches_won_human = 0
-        self.matches_won_ai = 0
-        self.ai_model_name = "champion_model"
         self.running = True
-        self.paused = False
 
 state = GameServerState()
 
@@ -166,41 +157,50 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <script>
-        function sendAction(act) {
+        // While an action is held it is re-sent every 100 ms (the server releases it to NOOP
+        // if no update arrives within 300 ms, e.g. when the tab loses focus).
+        let heldAction = 0;
+        let repeatTimer = null;
+
+        function post(act) {
             fetch('/action?act=' + act).catch(e => {});
         }
 
-        // Keyboard listeners
-        const activeKeys = {};
-        window.addEventListener('keydown', function(e) {
-            if (activeKeys[e.code]) return;
-            activeKeys[e.code] = true;
-
-            if (e.code === 'KeyW' || e.code === 'ArrowUp') {
-                sendAction(2);
-                document.getElementById('btn-up').classList.add('active');
-            } else if (e.code === 'KeyS' || e.code === 'ArrowDown') {
-                sendAction(3);
-                document.getElementById('btn-down').classList.add('active');
-            } else if (e.code === 'Space') {
-                sendAction(1);
-                document.getElementById('btn-fire').classList.add('active');
+        function sendAction(act) {
+            heldAction = act;
+            post(act);
+            if (repeatTimer) { clearInterval(repeatTimer); repeatTimer = null; }
+            if (act !== 0) {
+                repeatTimer = setInterval(() => post(heldAction), 100);
             }
+        }
+
+        const keyMap = {
+            KeyW: [2, 'btn-up'], ArrowUp: [2, 'btn-up'],
+            KeyS: [3, 'btn-down'], ArrowDown: [3, 'btn-down'],
+            Space: [1, 'btn-fire'],
+        };
+        const activeKeys = {};
+
+        window.addEventListener('keydown', function(e) {
+            const m = keyMap[e.code];
+            if (!m) return;
+            e.preventDefault();
+            if (activeKeys[e.code]) return;  // ignore OS auto-repeat; we repeat ourselves
+            activeKeys[e.code] = true;
+            sendAction(m[0]);
+            document.getElementById(m[1]).classList.add('active');
         });
 
         window.addEventListener('keyup', function(e) {
+            const m = keyMap[e.code];
+            if (!m) return;
             activeKeys[e.code] = false;
-            if (e.code === 'KeyW' || e.code === 'ArrowUp') {
-                document.getElementById('btn-up').classList.remove('active');
-                sendAction(0);
-            } else if (e.code === 'KeyS' || e.code === 'ArrowDown') {
-                document.getElementById('btn-down').classList.remove('active');
-                sendAction(0);
-            } else if (e.code === 'Space') {
-                document.getElementById('btn-fire').classList.remove('active');
-                sendAction(0);
-            }
+            document.getElementById(m[1]).classList.remove('active');
+            if (heldAction === m[0]) sendAction(0);
         });
+
+        window.addEventListener('blur', () => sendAction(0));
     </script>
 </body>
 </html>
@@ -211,14 +211,21 @@ class StreamHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/" or url.path == "/index.html":
+            body = HTML_PAGE.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(HTML_PAGE)))
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
+            self.wfile.write(body)
         elif url.path == "/action":
             qs = parse_qs(url.query)
-            act = int(qs.get("act", [0])[0])
+            try:
+                act = int(qs.get("act", ["0"])[0])
+            except ValueError:
+                act = -1
+            if act not in VALID_HUMAN_ACTIONS:
+                self.send_error(400, "act must be one of 0, 1, 2, 3")
+                return
             with state.lock:
                 state.human_action = act
                 state.last_action_time = time.time()
@@ -254,8 +261,11 @@ class StreamHandler(BaseHTTPRequestHandler):
         pass  # Suppress HTTP access logging to keep terminal clean
 
 
-def run_web_server(port: int):
-    server = HTTPServer(("0.0.0.0", port), StreamHandler)
+def run_web_server(port: int, host: str = "127.0.0.1"):
+    # Threaded: the MJPEG stream holds its connection open forever, so a single-threaded
+    # server would never get to the /action requests
+    server = ThreadingHTTPServer((host, port), StreamHandler)
+    server.daemon_threads = True
     server.serve_forever()
 
 
@@ -268,6 +278,7 @@ def parse_args():
         help="Path to AI model weights",
     )
     parser.add_argument("--mode", type=str, choices=["x11", "web"], default="x11", help="Control mode: x11 (desktop window) or web (browser)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Web server bind address (0.0.0.0 = all interfaces, no auth!)")
     parser.add_argument("--port", type=int, default=8080, help="Web server port (for web mode)")
     parser.add_argument("--fps", type=int, default=35, help="Playback speed for X11 mode")
     parser.add_argument("--target-score", type=int, default=11, help="Points needed to win a match (default: 11)")
@@ -287,25 +298,25 @@ def main():
     print(f"Target Score: First to {args.target_score} points | Device: {device}")
     print(f"Mode:         {args.mode.upper()}")
     if args.mode == "web":
-        print(f"Web Arena:    http://localhost:{args.port}")
+        print(f"Web Arena:    http://{args.host}:{args.port}")
     print(f"-------------------------------------------------------\n")
 
     # Load AI
-    ai_agent = DQNAgent(num_actions=6, device=device)
-    ai_agent.load(args.ai_checkpoint)
+    ai_agent = DQNAgent(num_actions=NUM_ACTIONS, device=device)
+    ai_agent.load_weights(args.ai_checkpoint)
 
-    env = pong_v3.parallel_env(render_mode="rgb_array")
-    obs, _ = env.reset(seed=42)
-
-    ai_stack = deque([process_frame(obs["first_0"], flip=False)] * 4, maxlen=4)
+    game = TwoPlayerPong(render_mode="rgb_array")
+    ai_state, _ = game.reset(seed=42)
 
     if args.mode == "web":
         # Launch web server in daemon thread
-        web_thread = threading.Thread(target=run_web_server, args=(args.port,), daemon=True)
+        web_thread = threading.Thread(target=run_web_server, args=(args.port, args.host), daemon=True)
         web_thread.start()
-        print(f"--> Web server started on http://0.0.0.0:{args.port}")
+        print(f"--> Web server started on http://{args.host}:{args.port}")
         print(f"--> Open http://localhost:{args.port} in your browser to play!")
     elif args.mode == "x11":
+        # Avoid indirect OpenGL/GLX errors over SSH X11 forwarding
+        os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
         cv2.namedWindow("Pong: Human vs AI", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Pong: Human vs AI", 640, 480)
         print("Starting X11 Window. Click on the game window to control!")
@@ -339,40 +350,25 @@ def main():
                 time.sleep(1.0 / args.fps)
                 with state.lock:
                     human_action = state.human_action
-                    # Auto-reset action if not refreshed recently (key release)
-                    if time.time() - state.last_action_time > 0.15:
+                    # Release the action if the browser stopped refreshing it
+                    if time.time() - state.last_action_time > ACTION_TIMEOUT_S:
                         state.human_action = 0
 
             # Determine AI action (Right paddle / first_0)
-            s_ai = torch.as_tensor(np.array(ai_stack), device=device).unsqueeze(0)
+            s_ai = torch.as_tensor(ai_state, device=device).unsqueeze(0)
             with torch.no_grad():
                 ai_q = ai_agent.online_net(s_ai)[0].cpu().numpy()
                 ai_action = int(np.argmax(ai_q))
 
-            # Step environment (frame skip 4)
-            r_ai_total = 0
-            r_human_total = 0
-            done = False
-
-            for _ in range(4):
-                # first_0 is AI (Right), second_0 is Human (Left)
-                obs, rewards, term, trunc, _ = env.step({"first_0": ai_action, "second_0": human_action})
-                if rewards["first_0"] > 0:
-                    r_ai_total += int(rewards["first_0"])
-                if rewards["second_0"] > 0:
-                    r_human_total += int(rewards["second_0"])
-
-                if term["first_0"] or trunc["first_0"] or term["second_0"] or trunc["second_0"]:
-                    done = True
-                    break
-
+            # Step environment (frame skip 4 + max-pool); first_0 is AI (Right), second_0 is Human (Left)
+            r_ai_total, r_human_total, done = game.step(ai_action, human_action)
             ai_pts += r_ai_total
             human_pts += r_human_total
-            ai_stack.append(process_frame(obs["first_0"], flip=False))
+            ai_state, _ = game.observe()
 
-            # Render frame
-            rgb = env.render()
-            frame = cv2.resize(rgb, (640, 480), interpolation=cv2.INTER_NEAREST)
+            # Render frame (OpenCV expects BGR)
+            frame = cv2.cvtColor(game.render(), cv2.COLOR_RGB2BGR)
+            frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
 
             # Draw HUD
             overlay = frame.copy()
@@ -403,22 +399,23 @@ def main():
                 if human_pts > ai_pts:
                     matches_human += 1
                     print(f"Match Finished: YOU WON! {human_pts} - {ai_pts} (Series: You {matches_human} - {matches_ai} AI)")
-                else:
+                elif ai_pts > human_pts:
                     matches_ai += 1
                     print(f"Match Finished: AI WON! {ai_pts} - {human_pts} (Series: You {matches_human} - {matches_ai} AI)")
-                obs, _ = env.reset()
-                ai_stack = deque([process_frame(obs["first_0"], flip=False)] * 4, maxlen=4)
+                else:
+                    print(f"Match Finished: DRAW {human_pts} - {ai_pts} (Series: You {matches_human} - {matches_ai} AI)")
+                ai_state, _ = game.reset()
                 human_pts = 0
                 ai_pts = 0
 
     except KeyboardInterrupt:
         print("\nStopping Human vs AI arena...")
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
     finally:
         state.running = False
-        env.close()
+        game.close()
         if args.mode == "x11":
             cv2.destroyAllWindows()
 

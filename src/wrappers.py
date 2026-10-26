@@ -5,6 +5,7 @@ Implements the standard preprocessing pipeline defined in Mnih et al. (2015):
 - FireResetEnv: Press FIRE on start for games that require it.
 - MaxAndSkipEnv: Frame skip (4) + element-wise max over last 2 frames to remove flicker.
 - EpisodicLifeEnv: End episode on life loss to encourage survival in bootstrapping.
+- FireOnLifeLossEnv: (Evaluation only) press FIRE after a life is lost in games that need it.
 - WarpFrame: Grayscale conversion and resize to 84x84.
 - FrameStack: Stack last 4 frames into shape (4, 84, 84).
 - ClipRewardEnv: Clip rewards to {-1, 0, +1}.
@@ -26,11 +27,15 @@ class NoopResetEnv(gym.Wrapper):
         super().__init__(env)
         self.noop_max = noop_max
         self.noop_action = 0
+        self._rng = np.random.default_rng()
         assert env.unwrapped.get_action_meanings()[0] == "NOOP"
 
     def reset(self, **kwargs) -> Tuple[np.ndarray, Dict[str, Any]]:
+        # Own generator, re-seeded by reset(seed=...), so a seed fully determines the no-op count
+        if kwargs.get("seed") is not None:
+            self._rng = np.random.default_rng(kwargs["seed"])
         obs, info = self.env.reset(**kwargs)
-        noops = np.random.randint(1, self.noop_max + 1)
+        noops = int(self._rng.integers(1, self.noop_max + 1))
         for _ in range(noops):
             obs, _, terminated, truncated, info = self.env.step(self.noop_action)
             if terminated or truncated:
@@ -51,7 +56,7 @@ class FireResetEnv(gym.Wrapper):
         obs, _, terminated, truncated, _ = self.env.step(1)  # 1 = FIRE
         if terminated or truncated:
             self.env.reset(**kwargs)
-        obs, _, terminated, truncated, info = self.env.step(2)  # 2 = UP (or safe action)
+        obs, _, terminated, truncated, info = self.env.step(2)  # 2 = RIGHT (Pong: paddle up)
         if terminated or truncated:
             obs, info = self.env.reset(**kwargs)
         return obs, info
@@ -77,6 +82,12 @@ class MaxAndSkipEnv(gym.Wrapper):
             if i == self._skip - 1:
                 self._obs_buffer[1] = obs
             if term or trunc:
+                # Episode ended early: make sure no frame from the previous step is pooled
+                if i < self._skip - 2:
+                    self._obs_buffer[0] = obs
+                    self._obs_buffer[1] = obs
+                elif i == self._skip - 2:
+                    self._obs_buffer[1] = obs
                 terminated = term
                 truncated = trunc
                 break
@@ -141,6 +152,34 @@ class EpisodicLifeEnv(gym.Wrapper):
         return obs, info
 
 
+class FireOnLifeLossEnv(gym.Wrapper):
+    """Press FIRE after a life is lost so play resumes in games like Breakout.
+
+    Only needed when EpisodicLifeEnv is off (evaluation). During training, EpisodicLifeEnv turns
+    every life loss into a reset() and FireResetEnv already presses FIRE there. Without this, a
+    greedy policy that never picks FIRE idles until the 108k-frame time limit.
+    """
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self.lives = 0
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        lives = self.env.unwrapped.ale.lives()
+        if not (terminated or truncated) and 0 < lives < self.lives:
+            obs, fire_reward, terminated, truncated, info = self.env.step(1)  # 1 = FIRE
+            reward += fire_reward
+            lives = self.env.unwrapped.ale.lives()
+        self.lives = lives
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, **kwargs) -> Tuple[np.ndarray, Dict[str, Any]]:
+        obs, info = self.env.reset(**kwargs)
+        self.lives = self.env.unwrapped.ale.lives()
+        return obs, info
+
+
 class FrameStack(gym.Wrapper):
     """Stack k consecutive 84x84 grayscale frames into a (k, 84, 84) observation tensor."""
 
@@ -191,6 +230,8 @@ def make_atari_env(
     action_meanings = env.unwrapped.get_action_meanings()
     if len(action_meanings) >= 3 and action_meanings[1] == "FIRE":
         env = FireResetEnv(env)
+        if not episodic_life:
+            env = FireOnLifeLossEnv(env)
 
     env = WarpFrame(env)
     if clip_rewards:

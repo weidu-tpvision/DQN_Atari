@@ -1,13 +1,14 @@
-"""Round-Robin Head-to-Head Tournament between top 10 Atari DQN checkpoints.
+"""Round-Robin Head-to-Head Tournament between up to 10 Atari DQN checkpoints.
 
-All 10 contenders play every other contender in direct PvP battles.
-Each pair plays 2 matches (home and away side-swap) to ensure 100% fair evaluation.
+Every contender plays every other contender in direct PvP battles.
+Each pair plays 2 matches (home and away side-swap) so neither side is favored.
 
 Rules:
-    - 10 Contenders -> 45 Pairings x 2 Games = 90 Total Matches
-    - First to target-score (default: 5 points per match)
-    - Full league table: Wins, Losses, Win Rate, Points For (PF), Points Against (PA), Differential (+/-)
-    - 10x10 Head-to-Head Cross Table Heatmap and Leaderboard Chart
+    - N Contenders -> N(N-1)/2 Pairings x 2 Games (10 contenders: 45 x 2 = 90 matches)
+    - First to target-score (default: 5 points per match); a match still level after
+      15,000 agent steps is a draw (half a win for each side in the win rate)
+    - Full league table: Wins, Draws, Losses, Win Rate, Points For (PF), Points Against (PA), Differential (+/-)
+    - NxN Head-to-Head Cross Table Heatmap and Leaderboard Chart
 
 Usage:
     python round_robin_tournament.py
@@ -16,29 +17,14 @@ Usage:
 
 import os
 import glob
-import re
 import itertools
 import argparse
 import numpy as np
 import pandas as pd
-import torch
-from collections import deque
 
-os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-
-from pettingzoo.atari import pong_v3
 from src.agent import DQNAgent
-from src.utils import get_device
-
-
-def process_frame(rgb: np.ndarray, flip: bool = False) -> np.ndarray:
-    """Preprocess 210x160 RGB into 84x84 grayscale, optionally horizontally flipped for Player 2."""
-    import cv2
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
-    if flip:
-        resized = cv2.flip(resized, 1)
-    return resized
+from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
+from src.utils import get_device, set_seed
 
 
 def get_top_10_checkpoints(ckpt_dir: str = "checkpoints") -> list[dict]:
@@ -81,189 +67,118 @@ def get_top_10_checkpoints(ckpt_dir: str = "checkpoints") -> list[dict]:
 def parse_args():
     parser = argparse.ArgumentParser(description="Round-Robin DQN PvP Tournament")
     parser.add_argument("--target-score", type=int, default=5, help="Points needed to win each match")
-    parser.add_argument("--epsilon", type=float, default=0.02, help="Slight exploration (2%) to prevent infinite deterministic loops")
+    parser.add_argument("--epsilon", type=float, default=0.02, help="Slight exploration (2%%) to prevent infinite deterministic loops")
     parser.add_argument("--base-seed", type=int, default=42, help="RNG seed")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Output directory")
     return parser.parse_args()
 
 
-def play_pvp_game(env, agent_right, agent_left, device: str, target_score: int, epsilon: float, seed: int) -> tuple[int, int]:
+def play_pvp_game(game: TwoPlayerPong, agent_right, agent_left, target_score: int, epsilon: float, seed: int,
+                  max_steps: int = 15000) -> tuple[int, int]:
     """Play a single head-to-head game between agent_right (P1) and agent_left (P2)."""
-    obs, _ = env.reset(seed=seed)
-    right_stack = deque([process_frame(obs["first_0"], flip=False)] * 4, maxlen=4)
-    left_stack = deque([process_frame(obs["second_0"], flip=True)] * 4, maxlen=4)
-
+    s_r, s_l = game.reset(seed=seed)
     right_pts = 0
     left_pts = 0
 
-    max_steps = 15000
-    steps = 0
-
-    while right_pts < target_score and left_pts < target_score and steps < max_steps:
-        steps += 1
-
-        # Agent actions
-        if epsilon > 0.0 and np.random.rand() < epsilon:
-            act_right = np.random.randint(6)
-        else:
-            s_r = torch.as_tensor(np.array(right_stack), device=device).unsqueeze(0)
-            with torch.no_grad():
-                act_right = int(agent_right.online_net(s_r)[0].argmax().item())
-
-        if epsilon > 0.0 and np.random.rand() < epsilon:
-            act_left = np.random.randint(6)
-        else:
-            s_l = torch.as_tensor(np.array(left_stack), device=device).unsqueeze(0)
-            with torch.no_grad():
-                act_left = int(agent_left.online_net(s_l)[0].argmax().item())
-
-        # Frame skip 4
-        for _ in range(4):
-            obs, rewards, term, trunc, _ = env.step({"first_0": act_right, "second_0": act_left})
-            if rewards["first_0"] > 0:
-                right_pts += int(rewards["first_0"])
-            if rewards["second_0"] > 0:
-                left_pts += int(rewards["second_0"])
-
-            if term["first_0"] or trunc["first_0"] or term["second_0"] or trunc["second_0"]:
-                break
-
-        right_stack.append(process_frame(obs["first_0"], flip=False))
-        left_stack.append(process_frame(obs["second_0"], flip=True))
+    for _ in range(max_steps):
+        act_right = policy_action(agent_right, s_r, epsilon)
+        act_left = policy_action(agent_left, s_l, epsilon)
+        r_gain, l_gain, done = game.step(act_right, act_left)
+        right_pts += r_gain
+        left_pts += l_gain
+        s_r, s_l = game.observe()
+        if done or right_pts >= target_score or left_pts >= target_score:
+            break
 
     return right_pts, left_pts
 
 
+def record_result(stats: dict, cross_wins: np.ndarray, right: int, left: int, r_pts: int, l_pts: int) -> int:
+    """Update league stats for one game; returns the winner index or -1 for a draw."""
+    stats["pts_for"][right] += r_pts
+    stats["pts_against"][right] += l_pts
+    stats["pts_for"][left] += l_pts
+    stats["pts_against"][left] += r_pts
+    if r_pts == l_pts:
+        stats["draws"][right] += 1
+        stats["draws"][left] += 1
+        return -1
+    winner, loser = (right, left) if r_pts > l_pts else (left, right)
+    stats["wins"][winner] += 1
+    stats["losses"][loser] += 1
+    cross_wins[winner][loser] += 1
+    return winner
+
+
 def main():
     args = parse_args()
+    set_seed(args.base_seed)
     device = get_device()
 
     contenders = get_top_10_checkpoints()
     n = len(contenders)
 
     print(f"\n==========================================================================================")
-    print(f"               ATARI PONG: TOP 10 HEAD-TO-HEAD ROUND-ROBIN TOURNAMENT                     ")
+    print(f"               ATARI PONG: HEAD-TO-HEAD ROUND-ROBIN TOURNAMENT                            ")
     print(f"==========================================================================================")
     print(f"Contenders ({n} models):")
     for idx, c in enumerate(contenders, 1):
         print(f"  [{idx:2d}] {c['label']:<20} ({c['name']})")
 
+    if n < 2:
+        print("Error: need at least 2 checkpoints for a round robin.")
+        return
+
     pairings = list(itertools.combinations(range(n), 2))
     total_matches = len(pairings) * 2
-    print(f"\nFormat: Full Round-Robin | 45 Pairings x 2 Games (Side-Swapped) = {total_matches} Total Matches")
+    print(f"\nFormat: Full Round-Robin | {len(pairings)} Pairings x 2 Games (Side-Swapped) = {total_matches} Total Matches")
     print(f"Match Rules: First to {args.target_score} points | Epsilon: {args.epsilon*100:.1f}% | Device: {device}")
     print(f"------------------------------------------------------------------------------------------\n")
 
-    # Preload all 10 agents onto GPU for fast execution
+    # Preload all agents onto the device for fast execution
     agents = []
     for c in contenders:
-        ag = DQNAgent(num_actions=6, device=device)
-        ag.load(c["path"])
+        ag = DQNAgent(num_actions=NUM_ACTIONS, device=device)
+        ag.load_weights(c["path"])
         agents.append(ag)
 
-    env = pong_v3.parallel_env(render_mode=None)
+    game = TwoPlayerPong()
 
     # Cross-table matrix: cross_wins[i][j] = wins of i against j
     cross_wins = np.zeros((n, n), dtype=int)
-    cross_points = np.zeros((n, n), dtype=int)
-
-    # Overall stats
-    wins = np.zeros(n, dtype=int)
-    losses = np.zeros(n, dtype=int)
-    pts_for = np.zeros(n, dtype=int)
-    pts_against = np.zeros(n, dtype=int)
+    stats = {k: np.zeros(n, dtype=int) for k in ("wins", "draws", "losses", "pts_for", "pts_against")}
 
     match_num = 0
-    match_records = []
-
     for idx1, idx2 in pairings:
-        c1 = contenders[idx1]
-        c2 = contenders[idx2]
+        # Game 1: idx1 on Right, idx2 on Left. Game 2: side swap.
+        for game_no, (right, left) in enumerate([(idx1, idx2), (idx2, idx1)], 1):
+            match_num += 1
+            r_pts, l_pts = play_pvp_game(
+                game, agents[right], agents[left], args.target_score, args.epsilon, seed=args.base_seed + match_num
+            )
+            winner = record_result(stats, cross_wins, right, left, r_pts, l_pts)
+            outcome = "draw" if winner < 0 else f"{contenders[winner]['label']} won"
+            print(f"[{match_num:2d}/{total_matches}] Game {game_no}: {contenders[right]['label']} {r_pts} - {l_pts} "
+                  f"{contenders[left]['label']} -> {outcome}", flush=True)
 
-        # Game A: c1 on Right, c2 on Left
-        match_num += 1
-        r_pts, l_pts = play_pvp_game(
-            env, agents[idx1], agents[idx2], device, args.target_score, args.epsilon, seed=args.base_seed + match_num
-        )
-        pts_for[idx1] += r_pts
-        pts_against[idx1] += l_pts
-        pts_for[idx2] += l_pts
-        pts_against[idx2] += r_pts
-        cross_points[idx1][idx2] += r_pts
-        cross_points[idx2][idx1] += l_pts
-
-        if r_pts > l_pts:
-            wins[idx1] += 1
-            losses[idx2] += 1
-            cross_wins[idx1][idx2] += 1
-            winner = c1["label"]
-        else:
-            wins[idx2] += 1
-            losses[idx1] += 1
-            cross_wins[idx2][idx1] += 1
-            winner = c2["label"]
-
-        match_records.append({
-            "match": match_num,
-            "p1": c1["label"],
-            "p2": c2["label"],
-            "score": f"{r_pts}-{l_pts}",
-            "winner": winner,
-            "side": f"{c1['label']} (Right) vs {c2['label']} (Left)",
-        })
-        print(f"[{match_num:2d}/{total_matches}] Game 1: {c1['label']} {r_pts} - {l_pts} {c2['label']} -> {winner} won", flush=True)
-
-        # Game B: Side Swap! c2 on Right, c1 on Left
-        match_num += 1
-        r_pts, l_pts = play_pvp_game(
-            env, agents[idx2], agents[idx1], device, args.target_score, args.epsilon, seed=args.base_seed + match_num
-        )
-        # Note: in Game B, c2 is Right, c1 is Left
-        pts_for[idx2] += r_pts
-        pts_against[idx2] += l_pts
-        pts_for[idx1] += l_pts
-        pts_against[idx1] += r_pts
-        cross_points[idx2][idx1] += r_pts
-        cross_points[idx1][idx2] += l_pts
-
-        if r_pts > l_pts:
-            wins[idx2] += 1
-            losses[idx1] += 1
-            cross_wins[idx2][idx1] += 1
-            winner = c2["label"]
-        else:
-            wins[idx1] += 1
-            losses[idx2] += 1
-            cross_wins[idx1][idx2] += 1
-            winner = c1["label"]
-
-        match_records.append({
-            "match": match_num,
-            "p1": c2["label"],
-            "p2": c1["label"],
-            "score": f"{r_pts}-{l_pts}",
-            "winner": winner,
-            "side": f"{c2['label']} (Right) vs {c1['label']} (Left)",
-        })
-        print(f"[{match_num:2d}/{total_matches}] Game 2: {c2['label']} {r_pts} - {l_pts} {c1['label']} -> {winner} won", flush=True)
-
-    env.close()
+    game.close()
 
     # Compile Leaderboard
     table = []
-    total_games_per_agent = (n - 1) * 2  # 9 * 2 = 18 games each
+    total_games_per_agent = (n - 1) * 2
     for i in range(n):
-        diff = pts_for[i] - pts_against[i]
-        win_pct = (wins[i] / total_games_per_agent) * 100.0
+        diff = stats["pts_for"][i] - stats["pts_against"][i]
+        win_pct = (stats["wins"][i] + 0.5 * stats["draws"][i]) / total_games_per_agent * 100.0
         table.append({
             "model": contenders[i]["name"],
             "label": contenders[i]["label"],
             "matches": total_games_per_agent,
-            "wins": int(wins[i]),
-            "losses": int(losses[i]),
+            "wins": int(stats["wins"][i]),
+            "draws": int(stats["draws"][i]),
+            "losses": int(stats["losses"][i]),
             "win_rate": float(win_pct),
-            "points_for": int(pts_for[i]),
-            "points_against": int(pts_against[i]),
+            "points_for": int(stats["pts_for"][i]),
+            "points_against": int(stats["pts_against"][i]),
             "diff": int(diff),
         })
 
@@ -274,23 +189,23 @@ def main():
     print(f"\n==========================================================================================================")
     print(f"                                   ROUND-ROBIN PvP FINAL STANDINGS                                        ")
     print(f"==========================================================================================================")
-    header = f"{'Rank':<5} | {'Model Checkpoint':<20} | {'Record (W-L)':<12} | {'Win Rate':<10} | {'PF':<5} | {'PA':<5} | {'Diff':<6}"
+    header = f"{'Rank':<5} | {'Model Checkpoint':<20} | {'Record (W-D-L)':<14} | {'Win Rate':<10} | {'PF':<5} | {'PA':<5} | {'Diff':<6}"
     print(header)
     print("-" * len(header))
 
     for rank, row in enumerate(table, 1):
         medal = " 🥇" if rank == 1 else (" 🥈" if rank == 2 else (" 🥉" if rank == 3 else "   "))
-        rec_str = f"{row['wins']}-{row['losses']}"
+        rec_str = f"{row['wins']}-{row['draws']}-{row['losses']}"
         diff_str = f"{row['diff']:+d}"
-        print(f"{rank:<2}{medal} | {row['label']:<20} | {rec_str:<12} | {row['win_rate']:>6.1f}%   | {row['points_for']:<5} | {row['points_against']:<5} | {diff_str:>6}")
+        print(f"{rank:<2}{medal} | {row['label']:<20} | {rec_str:<14} | {row['win_rate']:>6.1f}%   | {row['points_for']:<5} | {row['points_against']:<5} | {diff_str:>6}")
 
     print("=" * len(header))
 
     champ = table[0]
     print(f"\n🏆 PvP GRAND CHAMPION: {champ['label']} ({champ['model']})")
-    print(f"   * Dominant Record: {champ['wins']} Wins - {champ['losses']} Losses ({champ['win_rate']:.1f}% Win Rate)")
+    print(f"   * Record: {champ['wins']} Wins - {champ['draws']} Draws - {champ['losses']} Losses ({champ['win_rate']:.1f}% Win Rate)")
     print(f"   * Point Differential: {champ['diff']:+d} ({champ['points_for']} Scored, only {champ['points_against']} Conceded)")
-    print(f"   * Competed in {champ['matches']} Head-to-Head games against 9 other trained checkpoints!\n")
+    print(f"   * Competed in {champ['matches']} Head-to-Head games against {n - 1} other trained checkpoints!\n")
 
     # Save CSVs
     os.makedirs(args.output_dir, exist_ok=True)
@@ -335,10 +250,10 @@ def plot_round_robin_charts(table: list[dict], cross_wins: np.ndarray, labels: l
         w = bar.get_width()
         diff_val = diffs[i]
         diff_txt = f"+{diff_val}" if diff_val > 0 else str(diff_val)
-        ax1.text(w + 1.5, bar.get_y() + bar.get_height() / 2, f"{w:.1f}% ({table[i]['wins']}-{table[i]['losses']}, Diff: {diff_txt})", va="center", fontsize=9, fontweight="bold")
+        ax1.text(w + 1.5, bar.get_y() + bar.get_height() / 2, f"{w:.1f}% ({table[i]['wins']}-{table[i]['draws']}-{table[i]['losses']}, Diff: {diff_txt})", va="center", fontsize=9, fontweight="bold")
 
     # 2. Cross Table Heatmap
-    im = ax2.imshow(cross_wins, cmap="YlGnBu", vmin=0, vmax=2)
+    ax2.imshow(cross_wins, cmap="YlGnBu", vmin=0, vmax=2)
     ax2.set_xticks(np.arange(len(labels)))
     ax2.set_yticks(np.arange(len(labels)))
     ax2.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
