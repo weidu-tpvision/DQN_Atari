@@ -227,14 +227,14 @@ Run the test suite using `pytest`:
 
 ---
 
-## Training
+## Training: Single-Agent vs. Atari CPU (`train.py`)
 
-To train DQN on Pong (or any other Atari environment):
+To train DQN on Pong (or any other Atari environment) against the built-in Atari Stella CPU heuristic:
 
 ```bash
 .venv/bin/python3 train.py \
     --env ALE/Pong-v5 \
-    --total-steps 500000 \
+    --total-steps 1500000 \
     --buffer-size 100000 \
     --replay-start-size 10000 \
     --batch-size 32 \
@@ -249,7 +249,7 @@ To train DQN on Pong (or any other Atari environment):
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
 | `--env` | `ALE/Pong-v5` | Environment ID in Gymnasium / ALE |
-| `--total-steps` | `500,000` | Total environment interaction steps |
+| `--total-steps` | `1,500,000` | Total environment interaction steps |
 | `--buffer-size` | `100,000` | Capacity of experience replay memory |
 | `--replay-start-size` | `10,000` | Warm-up steps with random actions before training |
 | `--batch-size` | `32` | Minibatch size for stochastic gradient descent |
@@ -258,6 +258,60 @@ To train DQN on Pong (or any other Atari environment):
 | `--eps-decay` | `250,000` | Number of steps to anneal epsilon from start to end |
 | `--target-sync-freq` | `1,000` | Steps between updating target network ($\theta^- \leftarrow \theta$) |
 | `--train-freq` | `4` | Agent steps between gradient descent updates |
+| `--save-freq` | `50,000` | Step interval for saving periodic checkpoints |
+| `--eval-freq` | `25,000` | Step interval for greedy evaluation episodes |
+
+---
+
+## Self-Play Training: Multi-Agent League (`train_selfplay.py`)
+
+In single-agent training, the agent optimizes against a **fixed, static program** (the Stella CPU heuristic), which can cause the policy to overfit to CPU return patterns. To discover generalized, robust policies that converge toward a minimax Nash equilibrium, **Fictitious Self-Play (FSP)** trains the learner against an evolving pool of its own historical snapshots:
+
+```bash
+# Train self-play from scratch:
+.venv/bin/python3 train_selfplay.py \
+    --total-steps 1000000 \
+    --save-dir checkpoints_selfplay
+
+# Resume self-play training:
+.venv/bin/python3 train_selfplay.py \
+    --resume checkpoints_selfplay/latest.pt \
+    --additional-steps 500000
+```
+
+### Architectural & Preprocessing Consistency: `train.py` vs. `train_selfplay.py`
+
+`train.py` and `train_selfplay.py` are engineered to be **100% consistent across every dimension**, ensuring the **opponent is the only independent variable**:
+
+| Dimension | Single-Agent (`train.py`) | Self-Play (`train_selfplay.py`) | Status |
+| :--- | :--- | :--- | :--- |
+| **Neural Network** | Nature 2015 3-Conv + 2-FC (512 units) | Nature 2015 3-Conv + 2-FC (512 units) | **Identical** |
+| **Observation Tensor** | $(4, 84, 84)$ `uint8` stacked grayscale | $(4, 84, 84)$ `uint8` stacked grayscale | **Identical** |
+| **Frame Skipping** | 4-frame skip | 4-frame skip | **Identical** |
+| **Flicker Removal** | 2-frame max pooling (`obs_buffer.max(axis=0)`) | 2-frame max pooling (`obs_buffer.max(axis=0)`) | **Identical** |
+| **Color Normalization** | Native Atari Pong palette (Court 107, Paddles 121, Ball 236) | `remap_pz_to_gym` translates PettingZoo colors to Court 107, Paddles 121, Ball 236 | **Identical** |
+| **Player Perspective** | Paddle is always on Right | Paddle is always on Right (`cv2.flip` for Left player) | **Identical** |
+| **Initial Stochasticity** | 1–30 random NOOPs on reset (`NoopResetEnv`) | 1–30 random NOOPs on match reset | **Identical** |
+| **Replay Buffer** | 100,000 capacity, `uint8` circular array | 100,000 capacity, `uint8` circular array | **Identical** |
+| **Batch Size & LR** | Batch 32, Adam $\eta = 10^{-4}$ | Batch 32, Adam $\eta = 10^{-4}$ | **Identical** |
+| **Double DQN Target** | Online argmax, target net evaluation | Online argmax, target net evaluation | **Identical** |
+| **Huber Loss** | Smooth L1 Loss ($[-1, 1]$ TD error clipping) | Smooth L1 Loss ($[-1, 1]$ TD error clipping) | **Identical** |
+| **Target Sync Interval** | 1,000 steps | 1,000 steps | **Identical** |
+| **Exploration Schedule** | $\epsilon = 1.0 \to 0.02$ over 250,000 steps | $\epsilon = 1.0 \to 0.02$ over 250,000 steps | **Identical** |
+| **Terminal Bootstrapping**| Point loss ends transition (`EpisodicLifeEnv`) | Point loss ends transition (`point_terminal = True`) | **Identical** |
+| **Reward Clipping** | $\{-1, 0, +1\}$ | $\{-1, 0, +1\}$ zero-sum relative score | **Identical** |
+| **Crash & Resume Safety**| Atomic `.tmp` rename, RNG & tracker save | Atomic `.tmp` rename, RNG & tracker save | **Identical** |
+| **The Opponent** | **Deterministic Atari Stella CPU** | **Evolving Snapshot Pool (Fictitious Self-Play)** | **Independent Variable** |
+
+### The Color Palette Domain Shift & Resolution
+
+In PettingZoo `pong_v3` (2-player Atari mode), the Stella emulator switches to Atari Color Scheme #5:
+- **Court**: Brown `[144, 72, 17]` (gray `87`) vs. single-agent olive `[109, 118, 43]` (gray `107`).
+- **Paddles**: Player 1 is Green `[92, 186, 92]` (gray `147`), Player 2 is Orange `[213, 130, 74]` (gray `148`), whereas single-agent paddles are purple-blue `[101, 111, 228]` (gray `121`).
+
+Without correction, a model trained on single-agent Pong fails to register PettingZoo paddles due to out-of-distribution pixel values. `remap_pz_to_gym` surgically maps PettingZoo RGB values back to the exact single-agent colors before grayscale conversion and frame stacking, guaranteeing zero domain shift across both training and PvP arenas.
+
+---
 
 ---
 

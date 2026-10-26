@@ -27,6 +27,12 @@ from src.utils import get_device
 def parse_args():
     parser = argparse.ArgumentParser(description="Visualize trained DQN playing Pong")
     parser.add_argument(
+        "--env",
+        type=str,
+        default="ALE/Pong-v5",
+        help="Gymnasium Atari environment ID",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=str,
         default=(
@@ -54,7 +60,7 @@ def main():
 
     # Use rgb_array so we can render via pure X11 (cv2.imshow) avoiding Pygame GLX issues
     env = make_atari_env(
-        "ALE/Pong-v5",
+        args.env,
         clip_rewards=False,
         episodic_life=False,
         render_mode="rgb_array",

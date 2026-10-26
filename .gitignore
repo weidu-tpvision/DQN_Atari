@@ -10,15 +10,23 @@ __pycache__/
 .pytest_cache/
 
 # Large Training Checkpoints & Replay Buffers (keep small CSVs and plots)
-checkpoints/*.pt
-checkpoints/*.npz
-checkpoints/*.tmp
-checkpoints/*.log
-checkpoints/*.bak
+checkpoints*/**/*.pt
+checkpoints*/*.pt
+checkpoints*/**/*.npz
+checkpoints*/*.npz
+checkpoints*/**/*.tmp
+checkpoints*/*.tmp
+checkpoints*/**/*.log
+checkpoints*/*.log
+checkpoints*/**/*.bak
+checkpoints*/*.bak
 *.log
 *.bak
-!checkpoints/*.csv
-!checkpoints/*.png
+!checkpoints*/**/
+!checkpoints*/*.csv
+!checkpoints*/**/*.csv
+!checkpoints*/*.png
+!checkpoints*/**/*.png
 
 # Media files & recordings
 *.mp4

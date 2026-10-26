@@ -33,9 +33,22 @@ from src.agent import DQNAgent
 from src.utils import get_device
 
 
+def remap_pz_to_gym(pz_rgb: np.ndarray) -> np.ndarray:
+    """Remap PettingZoo Pong 2P color palette to match standard Gymnasium ALE/Pong-v5."""
+    gym_rgb = pz_rgb.copy()
+    bg_mask = np.all(pz_rgb == [144, 72, 17], axis=-1)
+    r_mask = np.all(pz_rgb == [92, 186, 92], axis=-1)
+    l_mask = np.all(pz_rgb == [213, 130, 74], axis=-1)
+    gym_rgb[bg_mask] = [109, 118, 43]
+    gym_rgb[r_mask] = [101, 111, 228]
+    gym_rgb[l_mask] = [101, 111, 228]
+    return gym_rgb
+
+
 def process_frame(rgb: np.ndarray, flip: bool = False) -> np.ndarray:
-    """Preprocess 210x160 RGB into 84x84 grayscale, optionally horizontally flipped for Player 2."""
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    """Preprocess 210x160 RGB into 84x84 grayscale matching ALE/Pong-v5, optionally flipped."""
+    remapped = remap_pz_to_gym(rgb)
+    gray = cv2.cvtColor(remapped, cv2.COLOR_RGB2GRAY)
     resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
     if flip:
         resized = cv2.flip(resized, 1)
@@ -106,6 +119,13 @@ def main():
     env = pong_v3.parallel_env(render_mode="rgb_array")
 
     if args.mode == "human":
+        if not os.environ.get("DISPLAY"):
+            print("\n[ERROR] No graphical display detected (environment variable $DISPLAY is not set).")
+            print("To view a live window over SSH:")
+            print("  1. Reconnect with X11 forwarding: 'ssh -X user@host' or 'ssh -Y user@host'")
+            print("  2. Alternatively, view live terminal scores: '--mode headless'")
+            print("  3. Or render an animated replay to watch directly: '--mode gif --output pvp_duel.gif'\n")
+            sys.exit(1)
         cv2.namedWindow("DQN Head-to-Head Arena", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("DQN Head-to-Head Arena", 640, 480)
         print("Starting live GUI window. Press 'q' or ESC on the game window anytime to exit.\n")
@@ -128,6 +148,7 @@ def main():
         left_label = p1_name if swap else p2_name
 
         obs, _ = env.reset(seed=200 + matches_played)
+        obs_buffer = np.zeros((2, 210, 160, 3), dtype=np.uint8)
         right_stack = deque([process_frame(obs["first_0"], flip=False)] * 4, maxlen=4)
         left_stack = deque([process_frame(obs["second_0"], flip=True)] * 4, maxlen=4)
 
@@ -150,15 +171,25 @@ def main():
             r_left_total = 0
             done = False
 
-            # Frame skip 4
-            for _ in range(4):
+            # Frame skip 4 with 2-frame max pooling to eliminate sprite flicker
+            for i in range(4):
                 obs, rewards, term, trunc, _ = env.step({"first_0": act_right, "second_0": act_left})
                 if rewards["first_0"] > 0:
                     r_right_total += int(rewards["first_0"])
                 if rewards["second_0"] > 0:
                     r_left_total += int(rewards["second_0"])
 
+                if i == 2:
+                    obs_buffer[0] = obs["first_0"]
+                elif i == 3:
+                    obs_buffer[1] = obs["first_0"]
+
                 if term["first_0"] or trunc["first_0"] or term["second_0"] or trunc["second_0"]:
+                    if i < 2:
+                        obs_buffer[0] = obs["first_0"]
+                        obs_buffer[1] = obs["first_0"]
+                    elif i == 2:
+                        obs_buffer[1] = obs["first_0"]
                     done = True
                     break
 
@@ -171,8 +202,9 @@ def main():
                 scorer = left_label
                 print(f"    Point! [{left_label} scored] Scoreboard: {left_label} {left_pts} - {right_pts} {right_label}", flush=True)
 
-            right_stack.append(process_frame(obs["first_0"], flip=False))
-            left_stack.append(process_frame(obs["second_0"], flip=True))
+            pooled_rgb = obs_buffer.max(axis=0)
+            right_stack.append(process_frame(pooled_rgb, flip=False))
+            left_stack.append(process_frame(pooled_rgb, flip=True))
 
             # Visual Rendering
             if args.mode in ["human", "gif", "mp4"]:
