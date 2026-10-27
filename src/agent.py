@@ -14,7 +14,7 @@ Counters:
 """
 
 import os
-from typing import Dict
+from typing import Callable, Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -36,6 +36,7 @@ class DQNAgent:
         target_sync_freq: int = 1_000,
         double_dqn: bool = False,
         device: torch.device = torch.device("cpu"),
+        model_fn: Optional[Callable[[], nn.Module]] = None,
     ):
         self.num_actions = num_actions
         self.gamma = gamma
@@ -47,10 +48,14 @@ class DQNAgent:
         self.device = device
 
         # Online network: updated at every train step
-        self.online_net = NatureDQN(in_channels=in_channels, num_actions=num_actions).to(device)
+        if model_fn is not None:
+            self.online_net = model_fn().to(device)
+            self.target_net = model_fn().to(device)
+        else:
+            self.online_net = NatureDQN(in_channels=in_channels, num_actions=num_actions).to(device)
+            self.target_net = NatureDQN(in_channels=in_channels, num_actions=num_actions).to(device)
 
         # Target network: frozen parameters θ^-, synchronized every `target_sync_freq` updates
-        self.target_net = NatureDQN(in_channels=in_channels, num_actions=num_actions).to(device)
         self.sync_target_network()
         self.target_net.eval()
 
@@ -68,17 +73,36 @@ class DQNAgent:
         fraction = min(1.0, self.env_steps / float(self.eps_decay_steps))
         return self.eps_start + fraction * (self.eps_end - self.eps_start)
 
-    def select_action(self, state: np.ndarray, deterministic: bool = False) -> int:
-        """Select action via epsilon-greedy policy.
+    def select_action(
+        self,
+        state: np.ndarray,
+        deterministic: bool = False,
+        action_mask: Optional[np.ndarray] = None,
+    ) -> int:
+        """Select action via epsilon-greedy policy with optional action masking.
 
         Args:
-            state: Array of shape (4, 84, 84) (uint8).
+            state: Array of observations.
             deterministic: If True, always select greedy action (for evaluation).
+            action_mask: Optional boolean array where True indicates a legal move.
 
         Returns:
             Action index (int).
         """
         epsilon = 0.0 if deterministic else self.get_epsilon()
+
+        if action_mask is not None:
+            legal_indices = np.where(action_mask)[0]
+            if len(legal_indices) == 0:
+                return 0
+            if epsilon > 0.0 and np.random.rand() < epsilon:
+                return int(np.random.choice(legal_indices))
+            with torch.no_grad():
+                state_tensor = torch.as_tensor(state, device=self.device).unsqueeze(0)
+                q_values = self.online_net(state_tensor).squeeze(0)
+                mask_tensor = torch.as_tensor(action_mask, device=self.device, dtype=torch.bool)
+                q_values[~mask_tensor] = -float("inf")
+                return int(q_values.argmax().item())
 
         if epsilon > 0.0 and np.random.rand() < epsilon:
             return np.random.randint(self.num_actions)
@@ -96,6 +120,7 @@ class DQNAgent:
         rewards: torch.Tensor,
         next_states: torch.Tensor,
         dones: torch.Tensor,
+        next_masks: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         """Perform one step of gradient descent on a sampled minibatch.
 
@@ -105,6 +130,9 @@ class DQNAgent:
             rewards: (batch_size,)
             next_states: (batch_size, 4, 84, 84)
             dones: (batch_size,)
+            next_masks: Optional (batch_size, num_actions) bool, True = legal in the next state.
+                Illegal actions are never taken, so their Q-values are never trained; they must
+                be excluded from the bootstrap max (and from Double DQN's argmax).
 
         Returns:
             Dictionary with training metrics (loss, mean_q).
@@ -118,11 +146,20 @@ class DQNAgent:
         with torch.no_grad():
             if self.double_dqn:
                 # Double DQN: action selection via online_net, evaluation via target_net
-                best_actions = self.online_net(next_states).argmax(dim=1, keepdim=True)
+                online_next_q = self.online_net(next_states)
+                if next_masks is not None:
+                    online_next_q = online_next_q.masked_fill(~next_masks, -float("inf"))
+                best_actions = online_next_q.argmax(dim=1, keepdim=True)
                 next_q = self.target_net(next_states).gather(1, best_actions).squeeze(1)
             else:
                 # Vanilla Nature 2015 DQN
-                next_q = self.target_net(next_states).max(dim=1)[0]
+                target_next_q = self.target_net(next_states)
+                if next_masks is not None:
+                    target_next_q = target_next_q.masked_fill(~next_masks, -float("inf"))
+                next_q = target_next_q.max(dim=1)[0]
+            if next_masks is not None:
+                # No legal move (game over): nothing to bootstrap from
+                next_q = torch.where(next_masks.any(dim=1), next_q, torch.zeros_like(next_q))
             targets = rewards + (1.0 - dones.float()) * self.gamma * next_q
 
         # 3. Compute Huber Loss

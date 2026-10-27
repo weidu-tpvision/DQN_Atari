@@ -91,3 +91,27 @@ def test_load_rejects_wrong_shape(tmp_path):
     other = ReplayBuffer(capacity=10, state_shape=(1, 3, 3))
     with pytest.raises(ValueError):
         other.load(path)
+
+
+def test_action_masks_stored_sampled_and_saved(tmp_path):
+    buffer = ReplayBuffer(capacity=8, state_shape=(1, 2, 2), action_mask_dim=4)
+    s = np.zeros((1, 2, 2), dtype=np.uint8)
+    buffer.push(s, 0, 0.0, s, False, next_mask=np.array([True, False, True, False]))
+    buffer.push(s, 1, 1.0, s, True, next_mask=np.array([False, False, False, False]))
+    batch = buffer.sample(16)
+    assert len(batch) == 6 and batch[5].shape == (16, 4)
+    path = str(tmp_path / "buf.npz")
+    buffer.save(path)
+    other = ReplayBuffer(capacity=8, state_shape=(1, 2, 2), action_mask_dim=4)
+    other.load(path)
+    np.testing.assert_array_equal(other.next_masks[:2], buffer.next_masks[:2])
+
+
+def test_plain_buffer_still_returns_five_and_loads_into_masked(tmp_path):
+    plain = _filled(10, 3)
+    assert len(plain.sample(4)) == 5
+    path = str(tmp_path / "buf.npz")
+    plain.save(path)
+    masked = ReplayBuffer(capacity=10, state_shape=(1, 2, 2), action_mask_dim=4)
+    masked.load(path)  # file has no masks: everything stays legal
+    assert len(masked) == 3 and masked.next_masks.all()

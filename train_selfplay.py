@@ -7,8 +7,10 @@ Implements Fictitious Self-Play (FSP) with an evolving Opponent Snapshot Pool:
   4. Only the learner's own transitions are stored in the replay buffer. The reward is the game's
      own per-player reward (points, plus PettingZoo's -1 penalty for not serving in time).
   5. When the learner's win-rate against the pool reaches the promotion threshold, a new
-     snapshot is promoted to the pool.
-  6. Atomic checkpointing and graceful shutdown on SIGINT (Ctrl+C).
+     snapshot is promoted to the pool. The pool keeps the newest --pool-size snapshots.
+  6. Opponents are sampled by Prioritized Fictitious Self-Play (default): mostly the snapshots the
+     learner still loses to, plus the newest snapshot --latest-prob of the time.
+  7. Atomic checkpointing and graceful shutdown on SIGINT (Ctrl+C).
 
 Preprocessing is shared with every other 2-player script via src/pong2p.py and matches
 train.py (see that module for the remaining differences, e.g. no sticky actions).
@@ -27,8 +29,10 @@ import time
 import glob
 import json
 import random
+import re
 import signal
 import argparse
+from collections import deque
 from typing import List, Tuple, Dict
 
 import numpy as np
@@ -40,34 +44,85 @@ from src.replay_buffer import ReplayBuffer
 from src.utils import set_seed, get_device, MetricTracker
 
 
-class SnapshotPool:
-    """Manages frozen historical checkpoints for Fictitious Self-Play."""
+def _snapshot_index(path: str) -> int:
+    match = re.match(r"snapshot_(\d+)_", os.path.basename(path))
+    return int(match.group(1)) if match else -1
 
-    def __init__(self, pool_dir: str, device: torch.device):
+
+class SnapshotPool:
+    """Frozen past copies of the learner: the opponents for self-play.
+
+    - At most `max_size` snapshots are active (0 = unlimited). Adding one beyond the cap retires
+      the oldest; its file stays on disk but it is no longer played against.
+    - Training opponents are sampled with probability `latest_prob` from the newest snapshot,
+      otherwise according to `sampling`:
+        "pfsp"    Prioritized Fictitious Self-Play (Vinyals et al. 2019, AlphaStar): weight
+                  (1 - p)^2, where p is the learner's recent win rate against that snapshot, so
+                  opponents the learner still struggles with are met more often.
+        "uniform" every active snapshot equally likely (classic fictitious self-play).
+    - Evaluation opponents (`for_eval=True`) are always uniform over the active pool, so the
+      promotion test measures strength against the whole pool.
+    """
+
+    def __init__(self, pool_dir: str, device: torch.device, max_size: int = 50, sampling: str = "pfsp",
+                 latest_prob: float = 0.2, result_window: int = 20):
         self.pool_dir = pool_dir
         self.device = device
+        self.max_size = max_size
+        self.sampling = sampling
+        self.latest_prob = latest_prob
+        self.result_window = result_window
         os.makedirs(pool_dir, exist_ok=True)
-        self.snapshots: List[str] = sorted(glob.glob(os.path.join(pool_dir, "snapshot_*.pt")))
+        files = sorted(glob.glob(os.path.join(pool_dir, "snapshot_*.pt")), key=_snapshot_index)
+        self.next_index = _snapshot_index(files[-1]) + 1 if files else 0
+        self.snapshots: List[str] = files[-max_size:] if max_size > 0 else files
         self.loaded_agents: Dict[str, DQNAgent] = {}
+        # Recent match results of the learner against each snapshot: 1 win, 0.5 draw, 0 loss
+        self.results: Dict[str, deque] = {}
 
     def add_snapshot(self, agent: DQNAgent, step: int) -> str:
-        """Save the learner's current weights into the pool."""
-        idx = len(self.snapshots)
-        path = os.path.join(self.pool_dir, f"snapshot_{idx:03d}_step_{step}.pt")
+        """Save the learner's current weights into the pool, retiring the oldest if over the cap."""
+        path = os.path.join(self.pool_dir, f"snapshot_{self.next_index:03d}_step_{step}.pt")
+        self.next_index += 1
         agent.save_weights(path)
         self.snapshots.append(path)
-        print(f"\n[POOL PROMOTION] Added new snapshot to pool: {os.path.basename(path)} (Total Pool Size: {len(self.snapshots)})")
+        retired = []
+        while self.max_size > 0 and len(self.snapshots) > self.max_size:
+            old = self.snapshots.pop(0)
+            self.loaded_agents.pop(old, None)
+            self.results.pop(os.path.basename(old), None)
+            retired.append(os.path.basename(old))
+        msg = f"\n[POOL PROMOTION] Added new snapshot to pool: {os.path.basename(path)} (Pool Size: {len(self.snapshots)})"
+        if retired:
+            msg += f" | retired {', '.join(retired)}"
+        print(msg)
         return path
 
-    def sample_opponent(self) -> Tuple[DQNAgent, str]:
-        """Sample an opponent agent using 80% uniform historical / 20% latest snapshot."""
+    def win_rate(self, path: str) -> float:
+        """Learner's recent win rate vs a snapshot, with a uniform Beta(1, 1) prior."""
+        res = self.results.get(os.path.basename(path), ())
+        return (sum(res) + 1.0) / (len(res) + 2.0)
+
+    def record_result(self, path: str, learner_score: float) -> None:
+        """Record a finished training match: learner_score is 1 (win), 0.5 (draw) or 0 (loss)."""
+        key = os.path.basename(path)
+        self.results.setdefault(key, deque(maxlen=self.result_window)).append(learner_score)
+
+    def _choose(self, for_eval: bool) -> str:
         if not self.snapshots:
             raise RuntimeError("Snapshot pool is empty!")
+        if for_eval or len(self.snapshots) == 1:
+            return random.choice(self.snapshots)
+        if random.random() < self.latest_prob:
+            return self.snapshots[-1]
+        if self.sampling == "uniform":
+            return random.choice(self.snapshots)
+        weights = [(1.0 - self.win_rate(p)) ** 2 for p in self.snapshots]
+        return random.choices(self.snapshots, weights=weights)[0]
 
-        if len(self.snapshots) == 1 or random.random() < 0.8:
-            chosen_path = random.choice(self.snapshots)
-        else:
-            chosen_path = self.snapshots[-1]
+    def sample_opponent(self, for_eval: bool = False) -> Tuple[DQNAgent, str]:
+        """Sample an opponent; returns (agent, snapshot path)."""
+        chosen_path = self._choose(for_eval)
 
         # Cache loaded agents for fast switching
         if chosen_path not in self.loaded_agents:
@@ -76,7 +131,16 @@ class SnapshotPool:
             opp.online_net.eval()
             self.loaded_agents[chosen_path] = opp
 
-        return self.loaded_agents[chosen_path], os.path.basename(chosen_path)
+        return self.loaded_agents[chosen_path], chosen_path
+
+    def state_dict(self) -> dict:
+        return {"results": {k: list(v) for k, v in self.results.items()}}
+
+    def load_state_dict(self, state: dict) -> None:
+        active = {os.path.basename(p) for p in self.snapshots}
+        self.results = {
+            k: deque(v, maxlen=self.result_window) for k, v in state.get("results", {}).items() if k in active
+        }
 
 
 def evaluate_learner_vs_pool(
@@ -88,7 +152,7 @@ def evaluate_learner_vs_pool(
     max_steps: int = 10_000,
     seed: int = 5000,
 ) -> Dict[str, float]:
-    """Evaluate learner against random snapshots from the pool with side alternation.
+    """Evaluate learner against uniformly sampled pool snapshots with side alternation.
 
     Both sides play greedily with a small epsilon so two deterministic policies can't lock
     into an endless rally; `max_steps` caps each match. Drawn matches count as half a win.
@@ -100,7 +164,7 @@ def evaluate_learner_vs_pool(
     total_pts_against = 0
 
     for m in range(num_matches):
-        opp_agent, _ = pool.sample_opponent()
+        opp_agent, _ = pool.sample_opponent(for_eval=True)
         learner_is_right = (m % 2 == 0)
         right_agent = learner if learner_is_right else opp_agent
         left_agent = opp_agent if learner_is_right else learner
@@ -159,6 +223,10 @@ def parse_args():
     parser.add_argument("--eval-target-score", type=int, default=7, help="Points needed to win an evaluation match")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
     parser.add_argument("--promotion-threshold", type=float, default=65.0, help="Win rate %% needed to add snapshot to pool")
+    parser.add_argument("--pool-size", type=int, default=50, help="Max active snapshots; oldest retired beyond this (0 = unlimited)")
+    parser.add_argument("--opponent-sampling", type=str, choices=["pfsp", "uniform"], default="pfsp",
+                        help="pfsp: favor opponents the learner loses to; uniform: classic fictitious self-play")
+    parser.add_argument("--latest-prob", type=float, default=0.2, help="Probability of playing the newest snapshot")
     parser.add_argument("--save-dir", type=str, default="checkpoints_selfplay", help="Directory to save selfplay data")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
     parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=True, help="Double DQN target calculation")
@@ -180,6 +248,7 @@ def main():
     print(f"=======================================================")
     print(f"Total Steps:   {args.total_steps:,} | Buffer: {args.buffer_size:,}")
     print(f"Double DQN:    {args.double_dqn} | Promotion Win-Rate: {args.promotion_threshold}%")
+    print(f"Pool:          max {args.pool_size} | sampling {args.opponent_sampling} | latest {args.latest_prob:.0%}")
     print(f"Save Dir:      {args.save_dir} | Device: {device}")
     if args.base_model:
         print(f"Base Model:    {args.base_model} (warm-starting policy)")
@@ -208,7 +277,8 @@ def main():
         learner.load_weights(args.base_model)
 
     # Initialize Pool
-    pool = SnapshotPool(pool_dir=pool_dir, device=device)
+    pool = SnapshotPool(pool_dir=pool_dir, device=device, max_size=args.pool_size,
+                        sampling=args.opponent_sampling, latest_prob=args.latest_prob)
     if not pool.snapshots:
         # Seed pool with initial learner snapshot M_0
         pool.add_snapshot(learner, step=0)
@@ -237,6 +307,8 @@ def main():
 
         if "tracker_history" in ckpt:
             tracker.load(ckpt["tracker_history"])
+        if "pool_state" in ckpt:
+            pool.load_state_dict(ckpt["pool_state"])
 
         if "rng_state" in ckpt:
             rng = ckpt["rng_state"]
@@ -313,6 +385,7 @@ def main():
             "global_step": step_num,
             "matches_played": matches_played,
             "pool_size": len(pool.snapshots),
+            "pool_state": pool.state_dict(),
             "tracker_history": tracker.history,
             "config": vars(args),
             "rng_state": {
@@ -340,7 +413,7 @@ def main():
     try:
         while global_step < target_total_steps and not interrupted:
             matches_played += 1
-            opp_agent, opp_label = pool.sample_opponent()
+            opp_agent, opp_path = pool.sample_opponent()
             learner_is_right = (random.random() < 0.5)
 
             s_r, s_l = game.reset(seed=args.seed + matches_played)
@@ -387,6 +460,10 @@ def main():
                     b_s, b_a, b_r, b_ns, b_d = replay_buffer.sample(args.batch_size)
                     update_metrics = learner.update(b_s, b_a, b_r, b_ns, b_d)
                     tracker.update(loss=update_metrics["loss"], mean_q=update_metrics["mean_q"])
+
+                if match_done:
+                    learner_pts, opp_pts = (r_pts, l_pts) if learner_is_right else (l_pts, r_pts)
+                    pool.record_result(opp_path, 1.0 if learner_pts > opp_pts else 0.5 if learner_pts == opp_pts else 0.0)
 
                 # Periodic Console Logging
                 if global_step % args.log_freq == 0:

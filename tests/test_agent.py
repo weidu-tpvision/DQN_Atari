@@ -117,3 +117,47 @@ def test_load_weights_resets_training_state(tmp_path):
 
     # The weights-only file is safe to load with weights_only=True
     torch.load(weights, weights_only=True)
+
+
+@pytest.mark.parametrize("double_dqn", [False, True])
+def test_masked_target_ignores_illegal_actions(double_dqn):
+    """Bootstrap max/argmax must only consider actions legal in the next state."""
+    from src.model_2048 import DQN2048
+
+    torch.manual_seed(0)
+    agent = DQNAgent(num_actions=4, gamma=0.9, double_dqn=double_dqn, model_fn=lambda: DQN2048())
+    with torch.no_grad():
+        for p in agent.target_net.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    b = 6
+    states = torch.randint(0, 2, (b, 16, 4, 4), dtype=torch.uint8)
+    next_states = torch.randint(0, 2, (b, 16, 4, 4), dtype=torch.uint8)
+    actions = torch.randint(0, 4, (b,))
+    rewards = torch.randn(b)
+    dones = torch.tensor([False, False, False, False, False, True])
+    masks = torch.tensor([[1, 0, 1, 0], [0, 0, 0, 1], [1, 1, 1, 1], [0, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=torch.bool)
+
+    with torch.no_grad():
+        q_t = agent.target_net(next_states)
+        select = agent.online_net(next_states) if double_dqn else q_t
+        select = select.masked_fill(~masks, -float("inf"))
+        best = select.argmax(dim=1)
+        next_q = q_t.gather(1, best.unsqueeze(1)).squeeze(1)
+        next_q[~masks.any(dim=1)] = 0.0  # no legal move: no bootstrap
+        expected = rewards + 0.9 * (~dones).float() * next_q
+        q_pred = agent.online_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        expected_loss = torch.nn.functional.smooth_l1_loss(q_pred, expected)
+
+    metrics = agent.update(states, actions, rewards, next_states, dones, next_masks=masks)
+    assert metrics["loss"] == pytest.approx(expected_loss.item(), rel=1e-5)
+
+
+def test_masked_select_action_never_picks_illegal():
+    from src.model_2048 import DQN2048
+
+    agent = DQNAgent(num_actions=4, model_fn=lambda: DQN2048(), eps_start=1.0, eps_end=1.0)
+    state = torch.randint(0, 2, (16, 4, 4), dtype=torch.uint8).numpy()
+    mask = torch.tensor([False, True, False, False]).numpy()
+    for deterministic in (True, False):
+        for _ in range(50):
+            assert agent.select_action(state, deterministic=deterministic, action_mask=mask) == 1
