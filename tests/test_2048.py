@@ -161,3 +161,66 @@ def test_train_and_resume_smoke(tmp_path):
     assert "Resumed at step 401" in second.stdout
     ckpt = torch.load(tmp_path / "latest.pt", weights_only=False)
     assert ckpt["global_step"] == 600 and ckpt["env_steps"] == 600 and "config" in ckpt
+
+
+class TestSymmetry:
+    def test_torch_and_numpy_transforms_agree(self):
+        from src.games.symmetry_2048 import SYMMETRIES, transform_board, transform_tensor
+        x = np.arange(2 * 16 * 16).reshape(2, 16, 4, 4)
+        for t in range(len(SYMMETRIES)):
+            np.testing.assert_array_equal(transform_tensor(torch.as_tensor(x), t).numpy(), transform_board(x, t))
+
+    def test_action_perms_are_equivariant_on_random_boards(self):
+        from src.games.symmetry_2048 import ACTION_PERMS, SYMMETRIES, transform_board
+        assert sorted(map(tuple, ACTION_PERMS.tolist())) == sorted(set(map(tuple, ACTION_PERMS.tolist())))
+        rng = np.random.default_rng(7)
+        game = Game2048(seed=0)
+        for _ in range(300):
+            board = np.where(rng.random((4, 4)) < 0.3, 0, 2 ** rng.integers(1, 7, (4, 4))).astype(np.int32)
+            for t in range(len(SYMMETRIES)):
+                for a in range(4):
+                    game.board = board
+                    moved, pts, _ = game.simulate_move(a)
+                    game.board = np.ascontiguousarray(transform_board(board, t))
+                    moved_t, pts_t, _ = game.simulate_move(int(ACTION_PERMS[t][a]))
+                    np.testing.assert_array_equal(moved_t, transform_board(moved, t))
+                    assert pts_t == pts
+
+    def test_augment_batch_keeps_transitions_consistent(self):
+        """An augmented transition must still be a valid game transition (before the spawn)."""
+        from src.games.symmetry_2048 import augment_batch
+        rng = np.random.default_rng(3)
+        game = Game2048(seed=0)
+        boards, actions, nexts, masks = [], [], [], []
+        while len(boards) < 64:
+            board = np.where(rng.random((4, 4)) < 0.3, 0, 2 ** rng.integers(1, 6, (4, 4))).astype(np.int32)
+            game.board = board
+            legal = game.get_legal_actions_mask()
+            if not legal.any():
+                continue
+            a = int(rng.choice(np.where(legal)[0]))
+            moved, _, _ = game.simulate_move(a)
+            game.board = moved
+            boards.append(board); actions.append(a); nexts.append(moved.copy()); masks.append(game.get_legal_actions_mask())
+        enc = lambda bs: torch.as_tensor(np.stack([board_to_one_hot(b) for b in bs]))
+        s, a, ns, m = augment_batch(enc(boards), torch.tensor(actions), enc(nexts), torch.as_tensor(np.stack(masks)))
+        decode = lambda x: np.where(x.argmax(0) > 0, 2 ** x.argmax(0), 0).astype(np.int32)
+        for i in range(64):
+            game.board = decode(s[i].numpy())
+            moved, _, changed = game.simulate_move(int(a[i]))
+            assert changed
+            np.testing.assert_array_equal(moved, decode(ns[i].numpy()))
+            game.board = decode(ns[i].numpy())
+            np.testing.assert_array_equal(game.get_legal_actions_mask(), m[i].numpy())
+
+
+def test_linear_and_log_rewards():
+    for mode, scale, expected in [("log", 1.0, 3.0), ("linear", 1 / 1024, 8 / 1024), ("linear", 1.0, 8.0)]:
+        env = Env2048(reward=mode, reward_scale=scale)
+        env.reset(seed=0)
+        env.game.board = np.array([[4, 4, 0, 0]] + [[0] * 4] * 3, dtype=np.int32)
+        _, reward, _, _, info = env.step(Game2048.LEFT)
+        assert info["points_gained"] == 8
+        assert reward == pytest.approx(expected)
+    with pytest.raises(ValueError):
+        Env2048(reward="sqrt")

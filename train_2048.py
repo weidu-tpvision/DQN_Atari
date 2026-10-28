@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from src.games.env_2048 import Env2048
+from src.games.symmetry_2048 import augment_batch
 from src.model_2048 import DQN2048
 from src.replay_buffer import ReplayBuffer
 from src.agent import DQNAgent
@@ -50,6 +51,12 @@ def parse_args():
     parser.add_argument("--save-dir", type=str, default="checkpoints_2048", help="Directory to save checkpoints")
     parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=True, help="Enable Double DQN")
     parser.add_argument("--action-masking", action=argparse.BooleanOptionalAction, default=True, help="Mask illegal moves")
+    parser.add_argument("--reward", type=str, choices=["log", "linear"], default="log",
+                        help="Per-move reward: log2(points gained) or the points gained (game score increment)")
+    parser.add_argument("--reward-scale", type=float, default=None,
+                        help="Multiplier for the reward (default: 1 for log, 1/1024 for linear)")
+    parser.add_argument("--symmetry-augment", action=argparse.BooleanOptionalAction, default=False,
+                        help="Train on a random one of the 8 board rotations/reflections of each sampled transition")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer on checkpoints")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -99,6 +106,8 @@ def evaluate_policy(agent: DQNAgent, num_episodes: int = 10, action_masking: boo
 
 
 def train(args):
+    if args.reward_scale is None:
+        args.reward_scale = 1.0 if args.reward == "log" else 1.0 / 1024
     os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
     device = get_device()
@@ -109,10 +118,11 @@ def train(args):
     print(f"Target Steps:   {args.total_steps:,} | Buffer: {args.buffer_size:,}")
     print(f"Batch Size:     {args.batch_size} | LR: {args.lr} | Gamma: {args.gamma}")
     print(f"Double DQN:     {args.double_dqn} | Action Masking: {args.action_masking}")
+    print(f"Reward:         {args.reward} x {args.reward_scale:g} | Symmetry Augment: {args.symmetry_augment}")
     print(f"Save Directory: {args.save_dir} | Device: {device}")
     print(f"-------------------------------------------------------\n")
 
-    env = Env2048()
+    env = Env2048(reward=args.reward, reward_scale=args.reward_scale)
 
     # Experience replay buffer stores (16, 4, 4) uint8 binary one-hot tensors
     replay_buffer = ReplayBuffer(
@@ -278,7 +288,12 @@ def train(args):
             # Gradient update
             if len(replay_buffer) >= args.replay_start_size and step % args.train_freq == 0:
                 # With action masking the batch also carries next-state legal masks for the target
-                metrics = agent.update(*replay_buffer.sample(args.batch_size))
+                batch = replay_buffer.sample(args.batch_size)
+                b_s, b_a, b_r, b_ns, b_d = batch[:5]
+                b_m = batch[5] if len(batch) == 6 else None
+                if args.symmetry_augment:
+                    b_s, b_a, b_ns, b_m = augment_batch(b_s, b_a, b_ns, b_m)
+                metrics = agent.update(b_s, b_a, b_r, b_ns, b_d, next_masks=b_m)
                 tracker.update(loss=metrics["loss"], mean_q=metrics["mean_q"])
 
             # Console logging

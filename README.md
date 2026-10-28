@@ -384,6 +384,15 @@ A single-player puzzle (no opponent, so no self-play) solved with the same `DQNA
 
 Evaluation uses the same fixed seeds every time, so `best_model.pt` is chosen on comparable scores.
 
+Options that matter most for reaching big tiles (a 2048 tile takes ~1,000 moves):
+- `--reward {log,linear}` / `--reward-scale` (default 1 for log, 1/1024 for linear). With
+  discounting, log reward makes distant big merges almost worthless (a 2048 merge 500 moves away is
+  worth ~3% of one move's reward at γ = 0.99); linear keeps them about one move's worth.
+- `--gamma`: the planning horizon is roughly 1/(1 − γ) moves (100 at 0.99, 200 at 0.995).
+- `--eps-end`: random moves late in a game can wreck a corner strategy; keep it small.
+- `--symmetry-augment`: each sampled transition is replaced by one of its 8 rotations/reflections
+  (move and legal mask remapped, derived from the game engine), multiplying rare late-game data.
+
 ---
 
 ## Metrics Logging & Comparison

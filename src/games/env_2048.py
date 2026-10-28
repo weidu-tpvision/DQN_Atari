@@ -28,12 +28,25 @@ def board_to_one_hot(board: np.ndarray, num_classes: int = 16) -> np.ndarray:
 
 
 class Env2048(gym.Env):
-    """Gymnasium Environment for 2048."""
+    """Gymnasium Environment for 2048.
+
+    Reward per move (`reward`):
+        "log"    log2 of the points gained by the move (0 if nothing merged). Compresses big merges:
+                 a 2048 merge is worth 11, a 4 merge 2.
+        "linear" the points gained (the game score increment), times `reward_scale`. Keeps big
+                 late-game merges large, so they still matter after discounting.
+    Illegal moves (board unchanged) give -0.5 in both modes; they never happen with action masking.
+    """
 
     metadata = {"render_modes": ["ansi", "human"]}
 
-    def __init__(self, render_mode: Optional[str] = None, max_steps: int = 5000):
+    def __init__(self, render_mode: Optional[str] = None, max_steps: int = 5000,
+                 reward: str = "log", reward_scale: float = 1.0):
         super().__init__()
+        if reward not in ("log", "linear"):
+            raise ValueError(f"reward must be 'log' or 'linear', got {reward!r}")
+        self.reward_mode = reward
+        self.reward_scale = reward_scale
         self.game = Game2048()
         self.action_space = spaces.Discrete(4)  # 0: UP, 1: DOWN, 2: LEFT, 3: RIGHT
         
@@ -60,16 +73,14 @@ class Env2048(gym.Env):
         self.current_step += 1
         changed, points, done = self.game.step(action)
 
-        # Reward shaping:
-        # If tiles merged, reward is log2 of the points gained in the move (e.g. 4 -> 2.0, 16 -> 4.0, 2048 -> 11.0)
-        # If move was illegal (didn't change board): penalty -0.5 (never happens with action masking)
-        if changed:
-            if points > 0:
-                reward = float(np.log2(points))
-            else:
-                reward = 0.0
-        else:
+        if not changed:
             reward = -0.5
+        elif points == 0:
+            reward = 0.0
+        elif self.reward_mode == "log":
+            reward = float(np.log2(points)) * self.reward_scale
+        else:
+            reward = float(points) * self.reward_scale
 
         truncated = (self.current_step >= self.max_steps)
         info = {
