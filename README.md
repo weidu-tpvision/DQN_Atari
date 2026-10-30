@@ -79,6 +79,7 @@ atari/
 ├── train.py                        # Resumable training loop with crash resilience & atomic saves
 ├── train_selfplay.py               # Fictitious self-play trainer (PettingZoo pong_v3)
 ├── train_2048.py / play_2048.py    # DQN for the 2048 puzzle (src/games/, src/model_2048.py)
+├── eval_2048.py                    # Compare 2048 checkpoints on 200 held-out games
 ├── evaluate.py                     # Deterministic greedy evaluation script
 ├── record_demo.py                  # Live X11 GUI visualizer with match HUD overlay
 ├── plot_metrics.py                 # 4-panel training and evaluation telemetry dashboard
@@ -392,6 +393,21 @@ Options that matter most for reaching big tiles (a 2048 tile takes ~1,000 moves)
 - `--eps-end`: random moves late in a game can wreck a corner strategy; keep it small.
 - `--symmetry-augment`: each sampled transition is replaced by one of its 8 rotations/reflections
   (move and legal mask remapped, derived from the game engine), multiplying rare late-game data.
+
+`eval_2048.py` compares checkpoints on 200 held-out games (fixed seeds, separate from the training
+evals) and prints the standard error. Results so far (log reward, γ = 0.99 unless noted):
+
+| Checkpoint | Mean score | ≥ 512 | ≥ 1024 | ≥ 2048 |
+|---|---|---|---|---|
+| No symmetry, 2M steps (`A_log_g0.99`) | 4457 ± 195 | 38% | 4% | 0% |
+| No symmetry, 10M steps (`checkpoints_2048`) | 6858 ± 212 | 74% | 15% | 0% |
+| `--eps-end 0.002`, 2M | 4639 ± 270 | 40% | 10% | 0% |
+| `--symmetry-augment`, 2M (`D2_symmetry`) | 7213 ± 262 | 68% | 17% | 0% |
+| `--symmetry-augment`, best (~1.75M) | 9310 ± 274 | 86% | 32% | 0.5% |
+| `--symmetry-augment --eps-end 0.002`, 2M | 7655 ± 268 | 73% | 22% | 0% |
+
+Symmetry augmentation at 2M steps beats 10M steps without it; the non-augmented run plateaus.
+Scores swing a lot between checkpoints (the 10M run scored 4930 at 5M), so keep the best one.
 
 ---
 
