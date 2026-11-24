@@ -17,7 +17,7 @@ import numpy as np
 
 from src.wrappers import make_atari_env
 from src.replay_buffer import ReplayBuffer
-from src.agent import DQNAgent, add_checkpoint_trust_flag
+from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
 from src.utils import (
     MetricTracker, capture_rng_state, configure_exploration, get_device, restore_rng_state, set_seed,
 )
@@ -25,33 +25,55 @@ from src.utils import (
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train DQN on Atari")
-    parser.add_argument("--env", type=str, default="ALE/Pong-v5", help="Gymnasium Atari environment ID")
+    parser.add_argument("--env", type=str, help="Gymnasium Atari environment ID")
     parser.add_argument("--total-steps", type=int, default=1_500_000, help="Total environment interaction steps")
     parser.add_argument("--additional-steps", type=int, default=None, help="Train for an additional N steps from checkpoint")
-    parser.add_argument("--buffer-size", type=int, default=100_000, help="Replay buffer capacity")
-    parser.add_argument("--replay-start-size", type=int, default=10_000, help="Warm-up steps before training starts")
-    parser.add_argument("--batch-size", type=int, default=32, help="Minibatch size for SGD")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (Adam)")
+    parser.add_argument("--buffer-size", type=int, help="Replay buffer capacity")
+    parser.add_argument("--replay-start-size", type=int, help="Warm-up steps before training starts")
+    parser.add_argument("--batch-size", type=int, help="Minibatch size for SGD")
+    parser.add_argument("--gamma", type=float, help="Discount factor")
+    parser.add_argument("--lr", type=float, help="Learning rate (Adam)")
     parser.add_argument("--eps-start", type=float, help="Initial exploration rate")
     parser.add_argument("--eps-end", type=float, help="Final exploration rate")
     parser.add_argument("--eps-decay", type=int, help="Environment steps to anneal epsilon from start to end")
-    parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Gradient updates between target network syncs")
-    parser.add_argument("--train-freq", type=int, default=4, help="Agent steps between training updates")
+    parser.add_argument("--target-sync-freq", type=int, help="Gradient updates between target network syncs")
+    parser.add_argument("--train-freq", type=int, help="Agent steps between training updates")
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving checkpoints")
     parser.add_argument("--eval-freq", type=int, default=25_000, help="Step interval to run greedy policy evaluation (<=0 to disable)")
     parser.add_argument("--eval-episodes", type=int, default=5, help="Number of greedy evaluation episodes")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--double-dqn", action="store_true", help="Enable Double DQN target calculation")
+    parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=None, help="Use Double DQN target calculation")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--replay-path", type=str, default=None, help="Path to replay buffer npz to resume from")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
     parser.add_argument("--early-stop-score", type=float, default=None, help="Stop early if mean evaluation score reaches this threshold (None to disable)")
     parser.add_argument("--patience", type=int, default=0, help="Stop early if no improvement over best evaluation score for N evaluations (0 to disable)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, help="Random seed")
     add_checkpoint_trust_flag(parser)
     return parser.parse_args()
+
+
+def resolve_training_config(args, checkpoint):
+    defaults = {
+        "env": "ALE/Pong-v5",
+        "buffer_size": 100_000,
+        "replay_start_size": 10_000,
+        "batch_size": 32,
+        "gamma": 0.99,
+        "lr": 1e-4,
+        "target_sync_freq": 1_000,
+        "train_freq": 4,
+        "double_dqn": False,
+        "seed": 42,
+    }
+    saved_config = checkpoint.get("config") or {}
+    for name, default in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, saved_config.get(name, default))
+
+    if args.buffer_size <= 0 or not 0 <= args.replay_start_size <= args.buffer_size:
+        raise ValueError("--buffer-size must be positive and --replay-start-size must be between 0 and --buffer-size")
 
 
 def is_game_over(env) -> bool:
@@ -92,9 +114,15 @@ def evaluate_policy(agent, env_id: str, num_episodes: int = 5, seed: int = 123) 
 
 
 def train(args):
+    device = get_device()
+    checkpoint_data = {}
+    if args.resume:
+        print(f"\n--> Resuming training from checkpoint: {args.resume}")
+        checkpoint_data = read_checkpoint(args.resume, device, trusted=args.trust_checkpoint)
+    lr_override = args.lr
+    resolve_training_config(args, checkpoint_data)
     os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
-    device = get_device()
 
     # Create training environment
     env = make_atari_env(args.env, clip_rewards=True, episodic_life=True)
@@ -124,16 +152,16 @@ def train(args):
     tracker = MetricTracker(window_size=100)
     start_step = 1
     episode_count = 0
-    checkpoint_data = {}
-
-    configure_exploration(agent, args)
+    configure_exploration(agent, args, checkpoint_data)
 
     # Handle Resumption
     if args.resume:
-        print(f"\n--> Resuming training from checkpoint: {args.resume}")
-        checkpoint_data = agent.load(args.resume, trusted=args.trust_checkpoint)
-        configure_exploration(agent, args, checkpoint_data)
-        # load() restores env_steps (epsilon schedule) and num_updates (target sync)
+        agent.load_training_state(checkpoint_data)
+        if lr_override is not None:
+            for group in agent.optimizer.param_groups:
+                group["lr"] = lr_override
+        args.lr = agent.optimizer.param_groups[0]["lr"]
+        # Counters continue the epsilon schedule and target sync cadence.
         start_step = agent.env_steps + 1
         episode_count = checkpoint_data.get("episode_count", 0)
 
@@ -231,9 +259,8 @@ def train(args):
         # Save model
         name = "latest.pt" if is_latest else f"dqn_{args.env.replace('/', '_')}_step_{step_num}.pt"
         ckpt_path = os.path.join(args.save_dir, name)
-        if args.save_buffer and (is_latest or step_num % 100_000 == 0):
-            extra["replay"] = replay_buffer.save_for_checkpoint(ckpt_path)
-        agent.save(ckpt_path, extra_state=extra)
+        save_replay = args.save_buffer and (is_latest or step_num % 100_000 == 0)
+        agent.save(ckpt_path, extra_state=extra, replay_buffer=replay_buffer if save_replay else None)
         print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
 
     current_step = start_step
@@ -250,7 +277,7 @@ def train(args):
 
             # Action selection (random during warm-up if buffer not yet filled, epsilon-greedy afterwards)
             if len(replay_buffer) < args.replay_start_size:
-                action = env.action_space.sample()
+                action = int(np.random.randint(num_actions))
             else:
                 action = agent.select_action(state, deterministic=False)
 
@@ -373,7 +400,12 @@ def train(args):
     final_step = current_step
     save_checkpoint(final_step, is_latest=True)
     final_path = os.path.join(args.save_dir, f"dqn_{args.env.replace('/', '_')}_final.pt")
-    agent.save(final_path, extra_state={"global_step": final_step, "episode_count": episode_count, "best_eval_score": best_eval_score})
+    agent.save(final_path, extra_state={
+        "global_step": final_step,
+        "episode_count": episode_count,
+        "best_eval_score": best_eval_score,
+        "config": vars(args),
+    })
     print(f"\nTraining completed! Saved final model to {final_path}", flush=True)
     log_file.close()
     csv_file.close()

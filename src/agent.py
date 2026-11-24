@@ -15,11 +15,14 @@ Counters:
 
 import os
 import pickle
+from pathlib import Path
 from typing import Callable, Dict, Optional
+from uuid import uuid4
 import numpy as np
 import torch
 import torch.nn as nn
 from src.model import NatureDQN
+from src.replay_buffer import ReplayBuffer
 
 
 def add_checkpoint_trust_flag(parser):
@@ -207,8 +210,8 @@ class DQNAgent:
         """Copy weights from online network to target network: θ^- ← θ."""
         self.target_net.load_state_dict(self.online_net.state_dict())
 
-    def save(self, path: str, extra_state: dict = None) -> None:
-        """Save model checkpoint atomically with optional training loop state."""
+    def save(self, path: str, extra_state: dict = None, *, replay_buffer: ReplayBuffer | None = None) -> None:
+        """Publish a model checkpoint after its optional replay snapshot is ready."""
         checkpoint = {
             "online_net": self.online_net.state_dict(),
             "target_net": self.target_net.state_dict(),
@@ -224,9 +227,29 @@ class DQNAgent:
         if extra_state:
             checkpoint.update(extra_state)
 
-        tmp_path = path + ".tmp"
-        torch.save(checkpoint, tmp_path)
-        os.replace(tmp_path, path)
+        previous_replay = None
+        new_replay = None
+        if replay_buffer is not None:
+            try:
+                previous = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+                previous_replay = previous.get("replay") if isinstance(previous, dict) else None
+                del previous
+            except (OSError, pickle.UnpicklingError, RuntimeError, ValueError, EOFError):
+                # Unreadable or legacy checkpoints can still be replaced.
+                pass
+            new_replay = replay_buffer.save_for_checkpoint(path)
+            checkpoint["replay"] = new_replay
+
+        tmp_path = Path(f"{path}.{uuid4().hex}.tmp")
+        try:
+            torch.save(checkpoint, tmp_path)
+            os.replace(tmp_path, path)
+        except Exception:
+            ReplayBuffer.discard_checkpoint_snapshot(path, new_replay)
+            raise
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        ReplayBuffer.discard_checkpoint_snapshot(path, previous_replay)
 
     def save_weights(self, path: str) -> None:
         """Save only the online network weights (small, loadable with weights_only=True)."""
@@ -237,6 +260,11 @@ class DQNAgent:
     def load(self, path: str, *, trusted: bool = False) -> dict:
         """Load full training state (weights, optimizer, counters) and return the checkpoint dict."""
         checkpoint = read_checkpoint(path, self.device, trusted=trusted)
+        self.load_training_state(checkpoint)
+        return checkpoint
+
+    def load_training_state(self, checkpoint: dict) -> None:
+        """Restore training state from an already loaded checkpoint."""
         self.online_net.load_state_dict(checkpoint["online_net"])
         self.target_net.load_state_dict(checkpoint.get("target_net", checkpoint["online_net"]))
         if "optimizer" in checkpoint:
@@ -244,7 +272,6 @@ class DQNAgent:
         # Older checkpoints stored the update count as "total_steps" and the env step as "global_step"
         self.num_updates = checkpoint.get("num_updates", checkpoint.get("total_steps", 0))
         self.env_steps = checkpoint.get("env_steps", checkpoint.get("global_step", 0))
-        return checkpoint
 
     def load_weights(self, path: str, *, trusted: bool = False) -> None:
         """Load only network weights (fresh optimizer and counters), e.g. to warm-start or to play."""

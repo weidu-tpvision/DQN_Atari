@@ -65,7 +65,7 @@ def evaluate(args):
 
         while not done:
             if args.epsilon > 0.0 and np.random.rand() < args.epsilon:
-                action = env.action_space.sample()
+                action = int(np.random.randint(num_actions))
             else:
                 action = agent.select_action(state, deterministic=True)
             next_state, reward, terminated, truncated, _ = env.step(action)

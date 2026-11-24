@@ -129,6 +129,48 @@ def test_checkpoint_replay_preserves_masks_and_rejects_replacement(tmp_path):
     assert restored.restore_for_checkpoint(checkpoint_path, checkpoint, None)
     np.testing.assert_array_equal(restored.next_masks[0], mask)
 
-    buffer.save_for_checkpoint(checkpoint_path)
+    replay_path = tmp_path / checkpoint["replay"]["file"]
+    buffer.save(str(replay_path), checkpoint_id="different-checkpoint")
     with pytest.raises(ValueError, match="does not match"):
         restored.restore_for_checkpoint(checkpoint_path, checkpoint, None)
+
+
+def test_failed_checkpoint_publish_preserves_previous_replay(tmp_path, monkeypatch):
+    from src.agent import DQNAgent
+
+    path = tmp_path / "latest.pt"
+    agent = DQNAgent(num_actions=2)
+    buffer = _filled(5, 2)
+    agent.save(str(path), replay_buffer=buffer)
+    previous = agent.load(str(path))
+    previous_replay = tmp_path / previous["replay"]["file"]
+
+    def fail_save(*args):
+        raise OSError("model write failed")
+
+    state = np.zeros((1, 2, 2), dtype=np.uint8)
+    buffer.push(state, 0, 10.0, state, False)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "save", fail_save)
+        with pytest.raises(OSError, match="model write failed"):
+            agent.save(str(path), replay_buffer=buffer)
+
+    restored = ReplayBuffer(capacity=5, state_shape=(1, 2, 2))
+    assert restored.restore_for_checkpoint(str(path), agent.load(str(path)), None)
+    assert len(restored) == 2
+    assert list(tmp_path.glob("latest_replay_*.npz")) == [previous_replay]
+
+    agent.save(str(path), replay_buffer=buffer)
+    assert restored.restore_for_checkpoint(str(path), agent.load(str(path)), None)
+    assert len(restored) == 3
+    assert not previous_replay.exists()
+
+
+def test_legacy_checkpoint_can_restore_fixed_replay_filename(tmp_path):
+    buffer = _filled(5, 2)
+    replay_path = tmp_path / "latest_replay.npz"
+    buffer.save(str(replay_path), checkpoint_id="legacy")
+    restored = ReplayBuffer(capacity=5, state_shape=(1, 2, 2))
+    checkpoint = {"replay": {"file": replay_path.name, "id": "legacy"}}
+    assert restored.restore_for_checkpoint(str(tmp_path / "latest.pt"), checkpoint, None)
+    assert len(restored) == 2

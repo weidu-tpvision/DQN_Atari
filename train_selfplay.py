@@ -430,9 +430,8 @@ def main():
         }
         name = "latest.pt" if is_latest else f"dqn_selfplay_step_{step_num}.pt"
         ckpt_path = os.path.join(args.save_dir, name)
-        if args.save_buffer and (is_latest or step_num % 100_000 == 0):
-            extra["replay"] = replay_buffer.save_for_checkpoint(ckpt_path)
-        learner.save(ckpt_path, extra_state=extra)
+        save_replay = args.save_buffer and (is_latest or step_num % 100_000 == 0)
+        learner.save(ckpt_path, extra_state=extra, replay_buffer=replay_buffer if save_replay else None)
         print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
 
     t0 = time.time()

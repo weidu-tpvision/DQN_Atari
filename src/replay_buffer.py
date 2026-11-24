@@ -95,8 +95,11 @@ class ReplayBuffer:
         """Save replay buffer state and arrays to compressed npz file atomically."""
         tmp_path = path + ".tmp.npz"
         arrays = {k: getattr(self, k)[:self.size] for k in self._keys()}
-        np.savez_compressed(tmp_path, checkpoint_id=checkpoint_id, ptr=self.ptr, size=self.size, **arrays)
-        os.replace(tmp_path, path)
+        try:
+            np.savez_compressed(tmp_path, checkpoint_id=checkpoint_id, ptr=self.ptr, size=self.size, **arrays)
+            os.replace(tmp_path, path)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     def load(self, path: str, *, checkpoint_id: str | None = None) -> None:
         """Load replay buffer state from compressed npz file.
@@ -146,10 +149,27 @@ class ReplayBuffer:
 
     def save_for_checkpoint(self, checkpoint_path: str) -> dict:
         path = Path(checkpoint_path)
-        replay_path = path.with_name(f"{path.stem}_replay.npz")
         checkpoint_id = uuid4().hex
+        replay_path = path.with_name(f"{path.stem}_replay_{checkpoint_id}.npz")
         self.save(str(replay_path), checkpoint_id=checkpoint_id)
         return {"file": replay_path.name, "id": checkpoint_id}
+
+    @staticmethod
+    def discard_checkpoint_snapshot(checkpoint_path: str, replay: dict) -> None:
+        """Remove an owned versioned snapshot without touching legacy or external replay files."""
+        if not isinstance(replay, dict):
+            return
+        path = Path(checkpoint_path)
+        name = replay.get("file")
+        if not isinstance(name, str) or Path(name).name != name:
+            return
+        if name != f"{path.stem}_replay_{replay.get('id')}.npz":
+            return
+        try:
+            path.with_name(name).unlink(missing_ok=True)
+        except OSError:
+            # A cleanup failure should not invalidate a published checkpoint.
+            pass
 
     def restore_for_checkpoint(self, checkpoint_path: str, checkpoint: dict, override: str | None) -> bool:
         if override is not None:

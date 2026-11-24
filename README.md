@@ -25,7 +25,7 @@ A high-performance, modular, and readable PyTorch implementation of the landmark
 | Replay memory / start | 1,000,000 / 50,000 | 100,000 / 10,000 |
 | Target update $C$ | 10,000 gradient updates | 1,000 gradient updates (= 4,000 env steps) |
 | Epsilon | 1.0 → 0.1 over 1M steps | 1.0 → 0.02 over 1M env steps |
-| Evaluation epsilon | 0.05 | 0 (greedy); `evaluate.py --epsilon 0.05` for the paper protocol |
+| Evaluation | 30 episodes capped at five minutes, epsilon 0.05 | 10 episodes by default, ALE episode limit, automatic FIRE after life loss where enabled, epsilon 0 (greedy) |
 | Weight init | default | Kaiming normal |
 | Replay storage | — | full 4-frame stacks for $s$ and $s'$ (~5.6 GB for 100k transitions) |
 
@@ -444,10 +444,10 @@ To plot or compare multiple runs:
 
 ## Crash Resilience & Atomic Saving
 
-- **Atomic File Writing**: Checkpoints write to `.tmp` first before an atomic rename (`os.replace`), preventing corrupt files if interrupted mid-write.
+- **Atomic Checkpoint Publishing**: The trainer writes a versioned replay snapshot first, then publishes the model with an atomic rename. An interruption before the rename leaves the previous model and replay available.
 - **Immediate Disk Sync**: The CSV writer calls `os.fsync()` after every log interval so no telemetry is lost if the machine restarts.
 - **Exception Trap**: Unhandled exceptions trigger an emergency checkpoint save before terminating.
-- **SIGINT Trap**: Pressing `Ctrl+C` cleanly saves `latest.pt` and `latest_replay.npz` before exiting (both trainers).
+- **SIGINT Trap**: Pressing `Ctrl+C` saves `latest.pt` and its associated replay snapshot when replay saving is enabled.
 
 ---
 
@@ -476,7 +476,7 @@ This restores:
 - Epsilon annealing schedule position
 - Best evaluation score and early-stopping patience counter
 - Python/NumPy/Torch RNG states
-- Replay buffer state (from `latest_replay.npz`; a different `--buffer-size` keeps the newest transitions) or warm-populates using the loaded policy
+- Replay buffer state (from the snapshot referenced by the checkpoint; a different `--buffer-size` keeps the newest transitions) or warm-populates using the loaded policy
 
 Checkpoints use PyTorch's restricted loader by default. For older checkpoints that
 contain serialized training state, pass `--trust-checkpoint` only when you trust
@@ -484,6 +484,9 @@ the source. When moving a training checkpoint, keep its associated replay file
 alongside it. Self-play also restores the snapshots listed in the checkpoint from
 the adjacent `pool/` directory. Resume restores the saved epsilon schedule, with
 explicit `--eps-start`, `--eps-end`, and `--eps-decay` flags taking precedence.
+For single-player Atari, saved training settings such as `--gamma`, `--train-freq`,
+`--target-sync-freq`, and Double DQN carry over unless explicitly overridden.
+Use `--no-double-dqn` to switch a Double DQN checkpoint to vanilla DQN.
 Use `--replay-path` to supply a known matching buffer for an older checkpoint
 that has no replay metadata.
 
@@ -503,7 +506,8 @@ To eliminate overestimation bias and accelerate convergence to human/superhuman 
     --total-steps 1500000
 ```
 
-To evaluate a saved model checkpoint across 10 full episodes (add `--epsilon 0.05` for the Nature evaluation protocol):
+To evaluate a saved checkpoint across 10 episodes, run the command below. Add
+`--epsilon 0.05` to choose a random action on 5% of agent steps.
 
 ```bash
 .venv/bin/python3 evaluate.py \
