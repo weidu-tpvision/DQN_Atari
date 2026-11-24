@@ -1,5 +1,8 @@
 """Unit tests for 2048 game engine, gymnasium environment, and neural network."""
 
+import sys
+from unittest.mock import Mock
+
 import numpy as np
 import torch
 import pytest
@@ -224,3 +227,31 @@ def test_linear_and_log_rewards():
         assert reward == pytest.approx(expected)
     with pytest.raises(ValueError):
         Env2048(reward="sqrt")
+
+
+def test_training_resume_restores_symmetry_augmentation_unless_overridden(tmp_path, monkeypatch):
+    import train_2048
+
+    augment = Mock(wraps=train_2048.augment_batch)
+    monkeypatch.setattr(train_2048, "augment_batch", augment)
+    monkeypatch.setattr(train_2048, "get_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(train_2048.signal, "signal", lambda *_: None)
+
+    def run(directory, *options, expected):
+        augment.reset_mock()
+        monkeypatch.setattr(sys, "argv", [
+            "train_2048.py", "--save-dir", str(directory), "--buffer-size", "4",
+            "--replay-start-size", "1", "--batch-size", "1", "--train-freq", "1",
+            "--eval-freq", "0", *options,
+        ])
+        train_2048.train(train_2048.parse_args())
+        checkpoint_path = directory / "latest.pt"
+        checkpoint = torch.load(checkpoint_path, weights_only=True)
+        assert checkpoint["config"]["symmetry_augment"] is expected
+        assert augment.called is expected
+        return str(checkpoint_path)
+
+    source = run(tmp_path / "source", "--total-steps", "2", "--symmetry-augment", expected=True)
+    resume = ("--resume", source, "--additional-steps", "1")
+    run(tmp_path / "restored", *resume, expected=True)
+    run(tmp_path / "disabled", *resume, "--no-symmetry-augment", expected=False)

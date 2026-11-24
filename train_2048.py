@@ -55,7 +55,7 @@ def parse_args():
                         help="Per-move reward: log2(points gained) or the points gained (game score increment)")
     parser.add_argument("--reward-scale", type=float, default=None,
                         help="Multiplier for the reward (default: 1 for log, 1/1024 for linear)")
-    parser.add_argument("--symmetry-augment", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--symmetry-augment", action=argparse.BooleanOptionalAction, default=None,
                         help="Train on a random one of the 8 board rotations/reflections of each sampled transition")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer on checkpoints")
@@ -157,6 +157,8 @@ def train(args):
     saved_masking = saved_config.get("action_masking", True)
     if args.action_masking is None:
         args.action_masking = saved_masking
+    if args.symmetry_augment is None:
+        args.symmetry_augment = saved_config.get("symmetry_augment", False)
 
     if args.additional_steps is not None:
         target_total_steps = (start_step - 1) + args.additional_steps

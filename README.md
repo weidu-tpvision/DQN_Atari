@@ -386,7 +386,9 @@ A single-player puzzle (no opponent, so no self-play) solved with the same `DQNA
 Evaluation uses the same fixed seeds every time, so `best_model.pt` is chosen on comparable scores.
 
 When resuming 2048 training, the checkpoint restores the exploration schedule,
-reward, and action masking settings. Replay is restored from the matching sidecar.
+reward, action masking, and symmetry augmentation settings. Use
+`--symmetry-augment` or `--no-symmetry-augment` to override saved augmentation.
+Replay is restored from the matching sidecar.
 For legacy training checkpoints from a trusted source, use `--trust-checkpoint`
 and pass the matching replay file explicitly with `--replay-path`.
 
