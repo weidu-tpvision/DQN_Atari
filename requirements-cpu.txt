@@ -1,0 +1,11 @@
+# Install torch first from https://download.pytorch.org/whl/cpu (see README.md).
+torch==2.15.0+cpu
+ale-py==0.12.1
+gymnasium==1.4.0
+ImageIO==2.38.2
+matplotlib==3.11.2
+moviepy==2.2.1
+numpy==2.4.6
+opencv-python==5.1.0.95
+pandas==3.1.1
+pytest==9.2.0

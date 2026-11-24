@@ -1,22 +1,23 @@
 """Tests for the shared 2-player Pong pipeline (src/pong2p.py)."""
 
+import ale_py
+import gymnasium as gym
 import numpy as np
 import pytest
-
-gym = pytest.importorskip("gymnasium")
-ale_py = pytest.importorskip("ale_py")
-pytest.importorskip("multi_agent_ale_py")
-pytest.importorskip("pettingzoo")
 
 from src.pong2p import TwoPlayerPong, process_frame
 from src.wrappers import WarpFrame
 
 
-def _gray_levels(frames):
-    return set(np.unique(np.concatenate([f.ravel() for f in frames])).tolist())
+@pytest.fixture(scope="module")
+def multiplayer_game():
+    pytest.importorskip("multi_agent_ale_py")
+    pytest.importorskip("pettingzoo")
+    return TwoPlayerPong
 
 
-def test_same_palette_as_gym_pong():
+@pytest.mark.multiplayer
+def test_same_palette_as_gym_pong(multiplayer_game):
     """PettingZoo frames must give the same gray levels the Gym-trained networks saw."""
     gym.register_envs(ale_py)
     genv = gym.make("ALE/Pong-v5", frameskip=1)
@@ -29,7 +30,7 @@ def test_same_palette_as_gym_pong():
             gym_frames.append(warp.observation(obs))
     genv.close()
 
-    game = TwoPlayerPong()
+    game = multiplayer_game()
     s_r, _ = game.reset(seed=0)
     pz_frames = []
     for t in range(100):
@@ -47,8 +48,9 @@ def test_same_palette_as_gym_pong():
     assert 87 in dominant(pz_frames)  # court background (144, 72, 17)
 
 
-def test_observations_shape_and_mirroring():
-    game = TwoPlayerPong()
+@pytest.mark.multiplayer
+def test_observations_shape_and_mirroring(multiplayer_game):
+    game = multiplayer_game()
     s_r, s_l = game.reset(seed=1)
     assert s_r.shape == (4, 84, 84) and s_r.dtype == np.uint8
     assert s_l.shape == (4, 84, 84)
@@ -59,8 +61,9 @@ def test_observations_shape_and_mirroring():
     game.close()
 
 
-def test_reset_seed_is_reproducible():
-    game = TwoPlayerPong()
+@pytest.mark.multiplayer
+def test_reset_seed_is_reproducible(multiplayer_game):
+    game = multiplayer_game()
     a, _ = game.reset(seed=7)
     for _ in range(20):
         game.step(2, 3)
@@ -78,14 +81,16 @@ def test_process_frame_matches_warpframe():
     gym.register_envs(ale_py)
     warp = WarpFrame(gym.make("ALE/Pong-v5", frameskip=1))
     np.testing.assert_array_equal(process_frame(rgb), warp.observation(rgb))
+    warp.close()
 
 
-def test_serve_penalty_reported_without_points():
+@pytest.mark.multiplayer
+def test_serve_penalty_reported_without_points(multiplayer_game):
     """Stalling the serve gives the server a -1 reward but scores no point.
 
     (The opening serve of a game is automatic, so one point can still happen while idle.)
     """
-    game = TwoPlayerPong(noop_max=0)
+    game = multiplayer_game(noop_max=0)
     game.reset(seed=0)
     penalties = 0
     for _ in range(1000):
@@ -97,8 +102,9 @@ def test_serve_penalty_reported_without_points():
     game.close()
 
 
-def test_point_rewards_are_zero_sum():
-    game = TwoPlayerPong(noop_max=0)
+@pytest.mark.multiplayer
+def test_point_rewards_are_zero_sum(multiplayer_game):
+    game = multiplayer_game(noop_max=0)
     game.reset(seed=0)
     for _ in range(2000):
         r_pts, l_pts, done = game.step(1, 0)  # right serves, left never moves

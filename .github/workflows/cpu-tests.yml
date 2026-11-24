@@ -1,0 +1,69 @@
+name: CPU tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MPLBACKEND: Agg
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.12"
+            multiplayer: true
+          - os: windows-latest
+            python: "3.11"
+            multiplayer: false
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-cpu.txt
+            requirements-multiplayer.txt
+      - name: Install OpenCV system library
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1
+      - name: Install CPU requirements
+        run: |
+          python -m pip install "torch==2.15.0+cpu" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-cpu.txt
+          python -m pip check
+      - name: Run core tests and Atari and 2048 training smoke tests
+        run: python -m pytest -q -m "not multiplayer"
+      - name: Install native multiplayer requirements
+        if: matrix.multiplayer
+        run: |
+          python -m pip install --only-binary=:all: -r requirements-multiplayer.txt
+          python -m pip check
+          python -c "from src.pong2p import TwoPlayerPong; game = TwoPlayerPong(); game.close()"
+      - name: Run native multiplayer tests and self-play training smoke test
+        if: matrix.multiplayer
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python -m pytest -q -m multiplayer

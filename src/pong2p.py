@@ -57,9 +57,14 @@ class TwoPlayerPong:
     """PettingZoo pong_v3 with Nature-DQN preprocessing for both paddles."""
 
     def __init__(self, render_mode: Optional[str] = None, noop_max: int = 30, frame_skip: int = 4, stack_k: int = 4):
+        from ale_py import roms
         from pettingzoo.atari import pong_v3
 
-        self.env = pong_v3.parallel_env(render_mode=render_mode)
+        # Use the Pong ROM already packaged with the single-player ALE installation.
+        pong_rom = roms.get_rom_path("pong")
+        if pong_rom is None:
+            raise FileNotFoundError("The ale-py installation does not provide the Pong ROM")
+        self.env = pong_v3.parallel_env(render_mode=render_mode, auto_rom_install_path=str(pong_rom.parent))
         self.noop_max = noop_max
         self.frame_skip = frame_skip
         self.stack_k = stack_k

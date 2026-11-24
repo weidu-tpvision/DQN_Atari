@@ -50,10 +50,12 @@ NatureDQN:
 
 ```
 atari/
-├── .venv/                          # Isolated Python virtual environment (CUDA 13 + PyTorch)
+├── .venv/                          # Local Python virtual environment
 ├── docs/                           # Paper comparison and self-play guide
 ├── README.md                       # Complete documentation & usage guide
-├── requirements.txt                # Python dependencies
+├── requirements-cpu.txt            # Portable CPU runtime and test dependencies
+├── requirements-multiplayer.txt    # Optional native multiplayer dependencies
+├── requirements.txt                # Historical Linux/CUDA 13 environment
 ├── .gitignore                      # Git exclusion rules for large models/buffers
 ├── pytest.ini
 ├── src/
@@ -213,28 +215,68 @@ Test your skills directly against the trained DQN agent! `play_remote.py` lets a
 
 ## Installation
 
-Tested with Python 3.12. `requirements.txt` pins the exact environment of the reported runs, including a PyTorch nightly for CUDA 13 that is not on PyPI (see the comment at the top of the file for how to install it, or replace the torch/CUDA pins with a stable build for your GPU). Create the virtual environment and install dependencies:
+### CPU setup
+
+Use 64-bit Python 3.11 or 3.12 on Linux or Windows. Create and activate a virtual environment.
 
 ```bash
-# 1. Create virtual environment
-python3 -m venv .venv
-
-# 2. Activate environment
+python -m venv .venv
 source .venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
 ```
+
+On Windows, run `python -m venv .venv` and activate it from PowerShell with
+`.\.venv\Scripts\Activate.ps1`. You can also run the commands below with
+`.\.venv\Scripts\python.exe` in place of `python`.
+
+Install the CPU PyTorch wheel from its official index, then install the rest of
+the requirements from PyPI.
+
+```bash
+python -m pip install "torch==2.15.0+cpu" --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements-cpu.txt
+python -m pip check
+```
+
+On a minimal Ubuntu installation, install `libgl1` if OpenCV reports a missing
+`libGL.so.1`. The `ale-py` package provides the single-player Atari ROMs.
+
+### Optional multiplayer
+
+For native Pong self-play, PvP, and live human-vs-AI play, install the multiplayer
+requirements in the same environment. The CI job uses Linux because
+`multi-agent-ale-py` publishes Linux wheels and Windows requires a source build.
+Two-player Pong uses the ROM packaged with `ale-py`.
+
+```bash
+python -m pip install -r requirements-multiplayer.txt
+```
+
+### Historical CUDA environment
+
+[`requirements.txt`](requirements.txt) records the Linux/CUDA 13 environment used
+for the reported runs. It includes a PyTorch nightly from the CUDA nightly index.
+See the file header for installation details.
 
 ---
 
 ## Running Unit Tests
 
-Run the test suite using `pytest`:
+Run the core suite after installing the CPU requirements. It includes short real
+Pong, Breakout, and 2048 runs that verify optimizer updates before and after resume.
 
 ```bash
-.venv/bin/python3 -m pytest tests/
+python -m pytest -q -m "not multiplayer"
 ```
+
+With the optional dependencies installed, run the native Pong environment tests
+and a real self-play train-and-resume smoke test.
+
+```bash
+python -m pytest -q -m multiplayer
+```
+
+[GitHub Actions](.github/workflows/cpu-tests.yml) runs core tests on Windows and Linux,
+plus native multiplayer tests on Linux.
 
 ---
 

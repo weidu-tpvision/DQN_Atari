@@ -9,7 +9,6 @@ import urllib.request
 import numpy as np
 import pytest
 
-pytest.importorskip("pettingzoo")
 import play_remote as pr
 
 
