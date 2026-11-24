@@ -1,4 +1,4 @@
-"""Evaluation script for trained Atari DQN models.
+"""Evaluate trained Atari DQN models on held-out games.
 
 Usage:
     python evaluate.py --checkpoint checkpoints/dqn_ALE_Pong-v5_final.pt --episodes 10
@@ -7,7 +7,6 @@ Usage:
 import os
 import argparse
 import numpy as np
-import torch
 import gymnasium as gym
 
 from src.wrappers import make_atari_env
@@ -23,12 +22,14 @@ def parse_args():
     parser.add_argument("--record-dir", type=str, default="recordings", help="Directory to save evaluation videos")
     parser.add_argument("--record", action="store_true", help="Whether to record video of evaluation")
     parser.add_argument("--epsilon", type=float, default=0.0, help="Random-action probability during evaluation (Nature 2015 used 0.05)")
-    parser.add_argument("--seed", type=int, default=123, help="Random seed")
+    parser.add_argument("--seed", type=int, default=50_000, help="First held-out game seed (default: 50000)")
     add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
 def evaluate(args):
+    if args.episodes <= 0 or args.seed < 0:
+        raise ValueError("Evaluation requires a positive --episodes and a nonnegative --seed")
     set_seed(args.seed)
     device = get_device()
 
@@ -58,7 +59,7 @@ def evaluate(args):
     lengths = []
 
     for ep in range(1, args.episodes + 1):
-        state, _ = env.reset(seed=args.seed + ep)
+        state, _ = env.reset(seed=args.seed + ep - 1)
         ep_reward = 0.0
         ep_length = 0
         done = False
@@ -83,7 +84,7 @@ def evaluate(args):
     mean_score = np.mean(scores)
     std_score = np.std(scores)
     print("\n" + "=" * 45)
-    print(f"Evaluation Results over {args.episodes} episodes:")
+    print(f"Evaluation Results over {args.episodes} episodes (first seed {args.seed}):")
     print(f"  Mean Score:   {mean_score:6.2f} +/- {std_score:5.2f}")
     print(f"  Min / Max:    {np.min(scores):6.1f} / {np.max(scores):6.1f}")
     print(f"  Mean Steps:   {np.mean(lengths):6.1f}")

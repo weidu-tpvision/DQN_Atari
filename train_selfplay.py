@@ -26,7 +26,9 @@ Usage:
 import os
 import sys
 import time
+import csv
 import filecmp
+import hashlib
 import re
 import shutil
 from pathlib import Path
@@ -35,7 +37,7 @@ import random
 import signal
 import argparse
 from collections import deque
-from typing import List, Tuple, Dict
+from typing import Callable, List, Tuple, Dict
 
 import numpy as np
 import torch
@@ -52,6 +54,16 @@ from src.utils import (
 def _snapshot_index(path: str) -> int:
     match = re.match(r"snapshot_(\d+)_", os.path.basename(path))
     return int(match.group(1)) if match else -1
+
+
+def load_frozen_opponent(path: str, device: torch.device, *, trusted: bool) -> DQNAgent:
+    # The models initialize on CPU before being moved to the requested device.
+    # Loading earlier during evaluation should not change RNG use during training.
+    with torch.random.fork_rng(devices=[]):
+        opponent = DQNAgent(num_actions=NUM_ACTIONS, device=device)
+    opponent.load_weights(path, trusted=trusted)
+    opponent.online_net.eval()
+    return opponent
 
 
 class SnapshotPool:
@@ -156,10 +168,12 @@ class SnapshotPool:
         key = os.path.basename(path)
         self.results.setdefault(key, deque(maxlen=self.result_window)).append(learner_score)
 
-    def _choose(self, for_eval: bool) -> str:
+    def _choose(self, for_eval: bool, rng: random.Random | None = None) -> str:
         if not self.snapshots:
             raise RuntimeError("Snapshot pool is empty!")
-        if for_eval or len(self.snapshots) == 1:
+        if for_eval:
+            return (rng or random).choice(self.snapshots)
+        if len(self.snapshots) == 1:
             return random.choice(self.snapshots)
         if random.random() < self.latest_prob:
             return self.snapshots[-1]
@@ -168,16 +182,13 @@ class SnapshotPool:
         weights = [(1.0 - self.win_rate(p)) ** 2 for p in self.snapshots]
         return random.choices(self.snapshots, weights=weights)[0]
 
-    def sample_opponent(self, for_eval: bool = False) -> Tuple[DQNAgent, str]:
+    def sample_opponent(self, for_eval: bool = False, rng: random.Random | None = None) -> Tuple[DQNAgent, str]:
         """Sample an opponent; returns (agent, snapshot path)."""
-        chosen_path = self._choose(for_eval)
+        chosen_path = self._choose(for_eval, rng)
 
         # Cache loaded agents for fast switching
         if chosen_path not in self.loaded_agents:
-            opp = DQNAgent(num_actions=NUM_ACTIONS, device=self.device)
-            opp.load_weights(chosen_path, trusted=self.trusted)
-            opp.online_net.eval()
-            self.loaded_agents[chosen_path] = opp
+            self.loaded_agents[chosen_path] = load_frozen_opponent(chosen_path, self.device, trusted=self.trusted)
 
         return self.loaded_agents[chosen_path], chosen_path
 
@@ -200,45 +211,64 @@ def evaluate_learner_vs_pool(
     max_steps: int = 10_000,
     seed: int = 5000,
 ) -> Dict[str, float]:
-    """Evaluate learner against uniformly sampled pool snapshots with side alternation.
+    """Evaluate against uniformly sampled snapshots for the promotion decision."""
+    opponent_rng = random.Random(seed)
+    return evaluate_matches(
+        learner, lambda: pool.sample_opponent(for_eval=True, rng=opponent_rng)[0],
+        num_matches, target_score, epsilon, max_steps, seed,
+    )
 
-    Both sides play greedily with a small epsilon so two deterministic policies can't lock
-    into an endless rally; `max_steps` caps each match. Drawn matches count as half a win.
-    """
+
+def evaluate_matches(
+    learner: DQNAgent,
+    opponent_for_match: Callable[[], DQNAgent],
+    num_matches: int = 20,
+    target_score: int = 7,
+    epsilon: float = 0.02,
+    max_steps: int = 10_000,
+    seed: int = 5000,
+) -> Dict[str, float]:
+    """Evaluate with alternating sides and an independent random stream for each match."""
     game = TwoPlayerPong()
     wins = 0
     draws = 0
     total_pts_for = 0
     total_pts_against = 0
 
-    for m in range(num_matches):
-        opp_agent, _ = pool.sample_opponent(for_eval=True)
-        learner_is_right = (m % 2 == 0)
-        right_agent = learner if learner_is_right else opp_agent
-        left_agent = opp_agent if learner_is_right else learner
+    was_training = learner.online_net.training
+    learner.online_net.eval()
+    try:
+        for m in range(num_matches):
+            opp_agent = opponent_for_match()
+            learner_is_right = (m % 2 == 0)
+            right_agent = learner if learner_is_right else opp_agent
+            left_agent = opp_agent if learner_is_right else learner
 
-        s_r, s_l = game.reset(seed=seed + m)
-        r_pts, l_pts = 0, 0
-        for _ in range(max_steps):
-            a_r = policy_action(right_agent, s_r, epsilon)
-            a_l = policy_action(left_agent, s_l, epsilon)
-            r_gain, l_gain, done = game.step(a_r, a_l)
-            r_pts += r_gain
-            l_pts += l_gain
-            s_r, s_l = game.observe()
-            if done or r_pts >= target_score or l_pts >= target_score:
-                break
+            match_seed = seed + m
+            action_rng = np.random.default_rng(match_seed)
+            s_r, s_l = game.reset(seed=match_seed)
+            r_pts, l_pts = 0, 0
+            for _ in range(max_steps):
+                a_r = policy_action(right_agent, s_r, epsilon, rng=action_rng)
+                a_l = policy_action(left_agent, s_l, epsilon, rng=action_rng)
+                r_gain, l_gain, done = game.step(a_r, a_l)
+                r_pts += r_gain
+                l_pts += l_gain
+                s_r, s_l = game.observe()
+                if done or r_pts >= target_score or l_pts >= target_score:
+                    break
 
-        learner_pts = r_pts if learner_is_right else l_pts
-        opp_pts = l_pts if learner_is_right else r_pts
-        total_pts_for += learner_pts
-        total_pts_against += opp_pts
-        if learner_pts > opp_pts:
-            wins += 1
-        elif learner_pts == opp_pts:
-            draws += 1
-
-    game.close()
+            learner_pts = r_pts if learner_is_right else l_pts
+            opp_pts = l_pts if learner_is_right else r_pts
+            total_pts_for += learner_pts
+            total_pts_against += opp_pts
+            if learner_pts > opp_pts:
+                wins += 1
+            elif learner_pts == opp_pts:
+                draws += 1
+    finally:
+        learner.online_net.train(was_training)
+        game.close()
     return {
         "win_rate": float((wins + 0.5 * draws) / num_matches * 100.0),
         "wins": wins,
@@ -247,6 +277,32 @@ def evaluate_learner_vs_pool(
         "pts_for": total_pts_for,
         "pts_against": total_pts_against,
     }
+
+
+def evaluate_anchors(learner, anchors, args, step: int) -> None:
+    path = Path(args.save_dir) / "selfplay_anchor_metrics.csv"
+    with path.open("a", encoding="utf-8", newline="") as metrics:
+        writer = csv.writer(metrics)
+        if metrics.tell() == 0:
+            writer.writerow([
+                "step", "opponent", "opponent_sha256", "first_seed", "target_score", "matches",
+                "wins", "draws", "win_rate", "pts_for", "pts_against",
+            ])
+        for opponent_path, digest, opponent in anchors:
+            result = evaluate_matches(
+                learner, lambda: opponent, num_matches=args.eval_matches,
+                target_score=args.eval_target_score, seed=args.eval_seed,
+            )
+            writer.writerow([
+                step, opponent_path, digest, args.eval_seed, args.eval_target_score, result["matches"],
+                result["wins"], result["draws"], f"{result['win_rate']:.2f}",
+                result["pts_for"], result["pts_against"],
+            ])
+            print(
+                f"[FIXED OPPONENT @ Step {step:7d}] {opponent_path} | "
+                f"Win rate: {result['win_rate']:.1f}% | Score: {result['pts_for']}-{result['pts_against']}",
+                flush=True,
+            )
 
 
 def parse_args():
@@ -261,6 +317,12 @@ def parse_args():
     parser.add_argument("--eval-freq", type=int, help="Step interval to evaluate vs pool and promote (<=0 to disable)")
     parser.add_argument("--eval-matches", type=int, help="Matches per pool evaluation (more = less noisy promotion)")
     parser.add_argument("--eval-target-score", type=int, help="Points needed to win an evaluation match")
+    parser.add_argument("--eval-seed", type=int, help="First seed of the fixed evaluation set (default: 5000)")
+    anchors = parser.add_mutually_exclusive_group()
+    anchors.add_argument("--eval-anchor", dest="eval_anchors", action="append", metavar="CHECKPOINT",
+                         help="Evaluate against this fixed checkpoint at every evaluation (repeatable)")
+    anchors.add_argument("--no-eval-anchors", dest="eval_anchors", action="store_const", const=[],
+                         help="Clear fixed opponents inherited from a checkpoint")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
     parser.add_argument("--promotion-threshold", type=float, help="Win rate %% needed to add snapshot to pool")
     parser.add_argument("--pool-size", type=int, help="Max active snapshots; oldest retired beyond this (0 = unlimited)")
@@ -286,8 +348,12 @@ def main():
     lr_override = args.lr
     resolve_training_config(
         args, ckpt, double_dqn=True, eval_freq=25_000, eval_matches=20, eval_target_score=7,
-        promotion_threshold=65.0, pool_size=50, opponent_sampling="pfsp", latest_prob=0.2,
+        eval_seed=5_000, eval_anchors=(), promotion_threshold=65.0,
+        pool_size=50, opponent_sampling="pfsp", latest_prob=0.2,
     )
+    if args.eval_freq > 0 and (args.eval_matches <= 0 or args.eval_target_score <= 0 or args.eval_seed < 0):
+        raise ValueError("Evaluation requires positive --eval-matches and --eval-target-score and a nonnegative --eval-seed")
+    args.eval_anchors = list(dict.fromkeys(str(Path(path).resolve()) for path in args.eval_anchors))
     set_seed(args.seed)
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -370,6 +436,16 @@ def main():
             print("No historical opponent snapshots found. Seeding the pool from the resumed learner.")
     if not pool.snapshots:
         pool.add_snapshot(learner, step=global_step)
+
+    anchor_opponents = []
+    if args.eval_freq > 0:
+        for path in args.eval_anchors:
+            opponent = load_frozen_opponent(path, device, trusted=args.trust_checkpoint)
+            digest = hashlib.sha256()
+            with open(path, "rb") as checkpoint_file:
+                for block in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+                    digest.update(block)
+            anchor_opponents.append((path, digest.hexdigest(), opponent))
 
     # Logging setup
     log_file = open(os.path.join(args.save_dir, "selfplay_training.log"), "a", buffering=1)
@@ -505,7 +581,7 @@ def main():
                         learner, pool,
                         num_matches=args.eval_matches,
                         target_score=args.eval_target_score,
-                        seed=args.seed * 1000 + global_step,
+                        seed=args.eval_seed,
                     )
                     eval_str = (
                         f"\n>>> [SELF-PLAY EVAL @ Step {global_step:7d}] "
@@ -515,6 +591,9 @@ def main():
                     )
                     print(eval_str, flush=True)
                     log_file.write(eval_str + "\n")
+
+                    if anchor_opponents:
+                        evaluate_anchors(learner, anchor_opponents, args, global_step)
 
                     # Check for promotion to pool
                     if eval_res["win_rate"] >= args.promotion_threshold:

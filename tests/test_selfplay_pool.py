@@ -1,5 +1,7 @@
 """Snapshot pool for self-play: size cap, numbering, PFSP sampling, persistence."""
 
+import csv
+import hashlib
 import os
 import random
 import sys
@@ -10,6 +12,7 @@ import torch
 
 import train_selfplay
 from src.agent import DQNAgent
+from src.utils import capture_rng_state
 from train_selfplay import SnapshotPool
 
 
@@ -86,7 +89,8 @@ def test_resume_copies_active_opponents_and_restores_results(tmp_path, agent):
     assert restored.next_index == 2
 
 
-def test_selfplay_trains_and_resumes_with_saved_settings(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_anchors", [False, True])
+def test_selfplay_trains_and_resumes_with_saved_settings(tmp_path, monkeypatch, agent, with_anchors):
     class ShortMatch:
         def __init__(self):
             self.state = np.zeros((4, 84, 84), dtype=np.uint8)
@@ -116,10 +120,20 @@ def test_selfplay_trains_and_resumes_with_saved_settings(tmp_path, monkeypatch):
         return torch.load(directory / "latest.pt", weights_only=True)
 
     source = tmp_path / "source"
+    evaluation = ["--eval-freq", "0"]
+    if with_anchors:
+        anchor_paths = [tmp_path / "first, anchor.pt", tmp_path / "second anchor.pt"]
+        for anchor_path in anchor_paths:
+            agent.save_weights(str(anchor_path))
+        evaluation = [
+            "--eval-freq", "2", "--eval-matches", "2", "--eval-seed", "5030",
+            *[flag for path in anchor_paths for flag in ("--eval-anchor", str(path))],
+        ]
     first = run(
         source, "--total-steps", "4", "--buffer-size", "6", "--replay-start-size", "2", "--batch-size", "2",
-        "--train-freq", "2", "--gamma", "0.95", "--target-sync-freq", "2", "--no-double-dqn", "--eval-freq", "0",
+        "--train-freq", "2", "--gamma", "0.95", "--target-sync-freq", "2", "--no-double-dqn",
         "--lr", "0.0003", "--pool-size", "3", "--opponent-sampling", "uniform", "--latest-prob", "0",
+        *evaluation,
     )
     assert first["num_updates"] == 2
 
@@ -130,5 +144,55 @@ def test_selfplay_trains_and_resumes_with_saved_settings(tmp_path, monkeypatch):
     assert all((dest / "pool" / name).is_file() for name in resumed["pool_snapshots"])
     assert resumed["config"]["double_dqn"] is True
     assert resumed["optimizer"]["param_groups"][0]["lr"] == 0.0003
-    for option in ("gamma", "target_sync_freq", "eval_freq", "pool_size", "opponent_sampling", "latest_prob"):
+    for option in ("gamma", "target_sync_freq", "eval_freq", "pool_size", "opponent_sampling", "latest_prob", "eval_anchors"):
         assert resumed["config"][option] == first["config"][option]
+
+    if with_anchors:
+        for directory, steps in ((source, ["2", "4"]), (dest, ["6"])):
+            with (directory / "selfplay_anchor_metrics.csv").open(encoding="utf-8", newline="") as metrics:
+                rows = list(csv.DictReader(metrics))
+            assert [(row["step"], row["opponent"]) for row in rows] == [
+                (step, str(anchor_path)) for step in steps for anchor_path in anchor_paths
+            ]
+            for row in rows:
+                with open(row["opponent"], "rb") as model:
+                    assert row["opponent_sha256"] == hashlib.sha256(model.read()).hexdigest()
+                assert row["first_seed"] == "5030" and row["matches"] == "2"
+
+
+def test_pool_evaluation_is_repeatable_and_preserves_training_rng(tmp_path, monkeypatch, agent):
+    matches = []
+    state = np.zeros((4, 84, 84), dtype=np.uint8)
+
+    class RecordingMatch:
+        def reset(self, seed):
+            matches.append([seed])
+            return self.observe()
+
+        def step(self, action_right, action_left):
+            matches[-1].append((action_right, action_left))
+            return 1, 0, True
+
+        def observe(self):
+            return state, state
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(train_selfplay, "TwoPlayerPong", RecordingMatch)
+    pool = SnapshotPool(str(tmp_path), torch.device("cpu"))
+    pool.add_snapshot(agent, 0)
+    pool.add_snapshot(agent, 1)
+    agent.online_net.train()
+    before = capture_rng_state()
+    options = {"num_matches": 8, "epsilon": 1.0, "seed": 600}
+    result = train_selfplay.evaluate_learner_vs_pool(agent, pool, **options)
+    assert pool.loaded_agents
+    assert train_selfplay.evaluate_learner_vs_pool(agent, pool, **options) == result
+    after = capture_rng_state()
+    assert before["python"] == after["python"]
+    np.testing.assert_equal(before["numpy"], after["numpy"])
+    assert torch.equal(before["torch"], after["torch"])
+    assert agent.online_net.training
+    assert matches[:8] == matches[8:]
+    assert [match[0] for match in matches[:8]] == list(range(600, 608))

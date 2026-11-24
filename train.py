@@ -32,7 +32,8 @@ def parse_args():
     add_training_arguments(parser)
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving checkpoints")
     parser.add_argument("--eval-freq", type=int, default=25_000, help="Step interval to run greedy policy evaluation (<=0 to disable)")
-    parser.add_argument("--eval-episodes", type=int, default=5, help="Number of greedy evaluation episodes")
+    parser.add_argument("--eval-episodes", type=int, help="Number of checkpoint evaluation episodes (default: 5)")
+    parser.add_argument("--eval-seed", type=int, help="First seed of the fixed checkpoint evaluation set (default: 1000)")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
@@ -52,7 +53,7 @@ def is_game_over(env) -> bool:
         return True
 
 
-def evaluate_policy(agent, env_id: str, num_episodes: int = 5, seed: int = 123) -> dict:
+def evaluate_policy(agent, env_id: str, num_episodes: int = 5, seed: int = 1_000) -> dict:
     """Run deterministic greedy policy evaluation on full episodes with raw unclipped rewards."""
     eval_env = make_atari_env(env_id, clip_rewards=False, episodic_life=False, render_mode=None)
     scores = []
@@ -88,7 +89,9 @@ def train(args):
         print(f"\n--> Resuming training from checkpoint: {args.resume}")
         checkpoint_data = read_checkpoint(args.resume, device, trusted=args.trust_checkpoint)
     lr_override = args.lr
-    resolve_training_config(args, checkpoint_data, env="ALE/Pong-v5")
+    resolve_training_config(args, checkpoint_data, env="ALE/Pong-v5", eval_episodes=5, eval_seed=1_000)
+    if args.eval_freq > 0 and (args.eval_episodes <= 0 or args.eval_seed < 0):
+        raise ValueError("Evaluation requires a positive --eval-episodes and a nonnegative --eval-seed")
     os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
 
@@ -185,8 +188,20 @@ def train(args):
         eval_csv_file.write("step,mean_score,std_score,min_score,max_score,mean_length,elapsed_seconds\n")
         eval_csv_file.flush()
 
-    best_eval_score = checkpoint_data.get("best_eval_score", -float("inf"))
-    patience_counter = checkpoint_data.get("patience_counter", 0)
+    saved_config = checkpoint_data.get("config") or {}
+    same_eval_set = all(
+        saved_config.get(option) == getattr(args, option)
+        for option in ("env", "eval_episodes", "eval_seed")
+    )
+    best_eval_score = float("-inf")
+    patience_counter = 0
+    if same_eval_set:
+        best_eval_score = checkpoint_data.get("best_eval_score", best_eval_score)
+        patience_counter = checkpoint_data.get("patience_counter", 0)
+    elif args.resume and "best_eval_score" in checkpoint_data:
+        message = "Checkpoint evaluation set changed or was unspecified. Starting a new best-score and patience comparison."
+        print(message, flush=True)
+        log_file.write(message + "\n")
 
     # The emulator state isn't checkpointed, so a resumed run starts a fresh game
     state, _ = env.reset(seed=args.seed + start_step - 1)
@@ -289,9 +304,10 @@ def train(args):
             # Periodic Evaluation (Deterministic Greedy Policy)
             if args.eval_freq > 0 and step % args.eval_freq == 0 and len(replay_buffer) >= args.replay_start_size:
                 elapsed = time.time() - start_time
-                eval_res = evaluate_policy(agent, args.env, num_episodes=args.eval_episodes, seed=args.seed + step)
+                eval_res = evaluate_policy(agent, args.env, num_episodes=args.eval_episodes, seed=args.eval_seed)
                 eval_str = (
-                    f"\n>>> [EVALUATION @ Step {step:7d}] Greedy Test Score ({args.eval_episodes} ep): "
+                    f"\n>>> [EVALUATION @ Step {step:7d}] Greedy Validation Score "
+                    f"({args.eval_episodes} ep, first seed {args.eval_seed}): "
                     f"{eval_res['mean_score']:6.2f} +/- {eval_res['std_score']:5.2f} "
                     f"(Min: {eval_res['min_score']:5.1f} | Max: {eval_res['max_score']:5.1f} | Avg Len: {eval_res['mean_length']:5.1f})\n"
                 )
@@ -357,6 +373,7 @@ def train(args):
         "global_step": final_step,
         "episode_count": episode_count,
         "best_eval_score": best_eval_score,
+        "patience_counter": patience_counter,
         "config": vars(args),
     })
     print(f"\nTraining completed! Saved final model to {final_path}", flush=True)

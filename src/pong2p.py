@@ -40,10 +40,16 @@ def process_frame(rgb: np.ndarray) -> np.ndarray:
     return cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
 
 
-def policy_action(agent, state: np.ndarray, epsilon: float = 0.0) -> int:
+def policy_action(
+    agent, state: np.ndarray, epsilon: float = 0.0, *, rng: np.random.Generator | None = None,
+) -> int:
     """Greedy action from `agent`, replaced by a uniformly random one with probability epsilon."""
-    if epsilon > 0.0 and np.random.rand() < epsilon:
-        return int(np.random.randint(NUM_ACTIONS))
+    if epsilon > 0.0:
+        if rng is None:
+            if np.random.rand() < epsilon:
+                return int(np.random.randint(NUM_ACTIONS))
+        elif rng.random() < epsilon:
+            return int(rng.integers(NUM_ACTIONS))
     return agent.select_action(state, deterministic=True)
 
 

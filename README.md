@@ -271,6 +271,8 @@ To train DQN on Pong (or any other Atari environment) against the built-in Atari
 | `--train-freq` | `4` | Agent steps between gradient descent updates |
 | `--save-freq` | `50,000` | Step interval for saving periodic checkpoints |
 | `--eval-freq` | `25,000` | Step interval for greedy evaluation episodes |
+| `--eval-episodes` | `5` | Number of checkpoint-validation episodes |
+| `--eval-seed` | `1,000` | First seed in the fixed checkpoint-validation set |
 | `--double-dqn` | off | Double DQN targets |
 | `--save-buffer` / `--no-save-buffer` | on | Save the replay buffer with checkpoints |
 
@@ -281,6 +283,10 @@ To train DQN on Pong (or any other Atari environment) against the built-in Atari
 Under `EpisodicLifeEnv` (e.g. Breakout) a life loss ends the bootstrapped episode, but the logged
 `avg_reward_100` / `avg_length_100` are per full game (clipped rewards). Evaluation runs full games
 and presses FIRE after a lost life (`FireOnLifeLossEnv`) so games like Breakout don't stall.
+Checkpoint selection reuses the same validation seeds at every evaluation. Resume
+inherits the validation set from the checkpoint. Changing the environment, seed, or
+episode count starts a fresh best-score comparison. Older checkpoints without an
+evaluation seed also start a fresh comparison. Existing CSV rows retain their historical scores.
 
 ---
 
@@ -310,6 +316,12 @@ Promotion: every `--eval-freq` steps the learner plays `--eval-matches` (default
 with 2% epsilon on both sides and a step cap. Draws count as half a win. If the win rate reaches
 `--promotion-threshold` (default 65%), the learner's weights are added to the pool. Only the
 learner's own transitions go into the replay buffer.
+
+Pass `--eval-anchor path/to/frozen-pong.pt` for each fixed opponent to track progress
+alongside pool promotion. The trainer evaluates every anchor on the same match seeds
+(starting at `--eval-seed`, default 5000) with alternating sides, and writes per-opponent
+results to `selfplay_anchor_metrics.csv`. Anchor paths are saved for resume and can
+be replaced with explicit `--eval-anchor` flags or cleared with `--no-eval-anchors`.
 
 Opponent pool:
 - **Size cap** (`--pool-size`, default 50): only the newest snapshots are played against; adding one
@@ -501,7 +513,9 @@ To eliminate overestimation bias and accelerate convergence to human/superhuman 
     --total-steps 1500000
 ```
 
-To evaluate a saved checkpoint across 10 episodes, run the command below. Add
+To evaluate a saved checkpoint across 10 held-out episodes, run the command below.
+The first seed defaults to 50,000, separate from checkpoint validation. If you
+change either seed range, keep the two ranges disjoint for final reporting. Add
 `--epsilon 0.05` to choose a random action on 5% of agent steps.
 
 ```bash
