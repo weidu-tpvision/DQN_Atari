@@ -16,18 +16,10 @@ A high-performance, modular, and readable PyTorch implementation of the landmark
 - **Huber Loss (Smooth L1)**: Matches the paper's $[-1, 1]$ TD-error gradient clipping for numerical stability.
 - **Frozen Target Network ($\theta^-$)**: Hard-sync every $C$ gradient updates to eliminate moving-target feedback loops.
 
-### Deviations from the Nature 2015 setup
+### Project documentation
 
-| Setting | Nature 2015 | This repo (defaults) |
-| :--- | :--- | :--- |
-| Environment | deterministic ALE (no sticky actions) | `ALE/Pong-v5`: sticky actions, `repeat_action_probability=0.25` |
-| Optimizer | RMSProp, lr 2.5e-4 | Adam, lr 1e-4, plus gradient-norm clipping at 10 |
-| Replay memory / start | 1,000,000 / 50,000 | 100,000 / 10,000 |
-| Target update $C$ | 10,000 gradient updates | 1,000 gradient updates (= 4,000 env steps) |
-| Epsilon | 1.0 → 0.1 over 1M steps | 1.0 → 0.02 over 1M env steps |
-| Evaluation | 30 episodes capped at five minutes, epsilon 0.05 | 10 episodes by default, ALE episode limit, automatic FIRE after life loss where enabled, epsilon 0 (greedy) |
-| Weight init | default | Kaiming normal |
-| Replay storage | — | full 4-frame stacks for $s$ and $s'$ (~5.6 GB for 100k transitions) |
+- [Atari DQN paper comparison](docs/DQN_PAPER_COMPARISON.md) covers the current implementation, the Nature paper, and DeepMind’s Lua release.
+- [Pong self-play](docs/PONG_SELF_PLAY.md) describes the implemented trainer, historical results, and the proposed fixed-opponent comparison.
 
 ---
 
@@ -59,7 +51,7 @@ NatureDQN:
 ```
 atari/
 ├── .venv/                          # Isolated Python virtual environment (CUDA 13 + PyTorch)
-├── DQN_ATARI_IMPLEMENTATION_PLAN.md# Comprehensive engineering blueprint
+├── docs/                           # Paper comparison and self-play guide
 ├── README.md                       # Complete documentation & usage guide
 ├── requirements.txt                # Python dependencies
 ├── .gitignore                      # Git exclusion rules for large models/buffers
@@ -294,7 +286,7 @@ and presses FIRE after a lost life (`FireOnLifeLossEnv`) so games like Breakout 
 
 ## Self-Play Training: Multi-Agent League (`train_selfplay.py`)
 
-In single-agent training, the agent optimizes against a **fixed, static program** (the Stella CPU heuristic), which can cause the policy to overfit to CPU return patterns. To discover generalized, robust policies that converge toward a minimax Nash equilibrium, **Fictitious Self-Play (FSP)** trains the learner against an evolving pool of its own historical snapshots:
+Single-agent training plays against the built-in Atari CPU. The two-player trainer learns against an evolving pool of frozen copies of its own policy. See the [self-play guide](docs/PONG_SELF_PLAY.md) for the game rules and how to interpret results:
 
 ```bash
 # Train self-play from scratch:
@@ -326,8 +318,9 @@ Opponent pool:
 - **Prioritized Fictitious Self-Play** (`--opponent-sampling pfsp`, default; AlphaStar): the newest
   snapshot is played `--latest-prob` (default 20%) of the time; otherwise a snapshot is chosen with
   weight (1 − p)², where p is the learner's win rate over its last 20 finished matches against it
-  (Beta(1,1) prior). Opponents the learner still loses to come up more often. `--opponent-sampling
-  uniform` restores classic fictitious self-play. The win-rate table is saved in checkpoints.
+  (Beta(1,1) prior). Opponents the learner still loses to come up more often. With
+  `--opponent-sampling uniform`, the non-latest branch samples uniformly. Add `--latest-prob 0`
+  for uniform sampling across the entire active pool. The win-rate table is saved in checkpoints.
 
 The training reward is the 2-player game's own per-player reward, clipped: +1 for a point won,
 −1 for a point lost, and −1 when the player holding the ball fails to serve within ~2 seconds
