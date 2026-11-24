@@ -18,8 +18,9 @@ import numpy as np
 from src.wrappers import make_atari_env
 from src.replay_buffer import ReplayBuffer
 from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
+from src.training import add_training_arguments, resolve_training_config, restore_training_state
 from src.utils import (
-    MetricTracker, capture_rng_state, configure_exploration, get_device, restore_rng_state, set_seed,
+    MetricTracker, capture_rng_state, configure_exploration, get_device, set_seed,
 )
 
 
@@ -28,52 +29,19 @@ def parse_args():
     parser.add_argument("--env", type=str, help="Gymnasium Atari environment ID")
     parser.add_argument("--total-steps", type=int, default=1_500_000, help="Total environment interaction steps")
     parser.add_argument("--additional-steps", type=int, default=None, help="Train for an additional N steps from checkpoint")
-    parser.add_argument("--buffer-size", type=int, help="Replay buffer capacity")
-    parser.add_argument("--replay-start-size", type=int, help="Warm-up steps before training starts")
-    parser.add_argument("--batch-size", type=int, help="Minibatch size for SGD")
-    parser.add_argument("--gamma", type=float, help="Discount factor")
-    parser.add_argument("--lr", type=float, help="Learning rate (Adam)")
-    parser.add_argument("--eps-start", type=float, help="Initial exploration rate")
-    parser.add_argument("--eps-end", type=float, help="Final exploration rate")
-    parser.add_argument("--eps-decay", type=int, help="Environment steps to anneal epsilon from start to end")
-    parser.add_argument("--target-sync-freq", type=int, help="Gradient updates between target network syncs")
-    parser.add_argument("--train-freq", type=int, help="Agent steps between training updates")
+    add_training_arguments(parser)
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving checkpoints")
     parser.add_argument("--eval-freq", type=int, default=25_000, help="Step interval to run greedy policy evaluation (<=0 to disable)")
     parser.add_argument("--eval-episodes", type=int, default=5, help="Number of greedy evaluation episodes")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=None, help="Use Double DQN target calculation")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--replay-path", type=str, default=None, help="Path to replay buffer npz to resume from")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
     parser.add_argument("--early-stop-score", type=float, default=None, help="Stop early if mean evaluation score reaches this threshold (None to disable)")
     parser.add_argument("--patience", type=int, default=0, help="Stop early if no improvement over best evaluation score for N evaluations (0 to disable)")
-    parser.add_argument("--seed", type=int, help="Random seed")
     add_checkpoint_trust_flag(parser)
     return parser.parse_args()
-
-
-def resolve_training_config(args, checkpoint):
-    defaults = {
-        "env": "ALE/Pong-v5",
-        "buffer_size": 100_000,
-        "replay_start_size": 10_000,
-        "batch_size": 32,
-        "gamma": 0.99,
-        "lr": 1e-4,
-        "target_sync_freq": 1_000,
-        "train_freq": 4,
-        "double_dqn": False,
-        "seed": 42,
-    }
-    saved_config = checkpoint.get("config") or {}
-    for name, default in defaults.items():
-        if getattr(args, name) is None:
-            setattr(args, name, saved_config.get(name, default))
-
-    if args.buffer_size <= 0 or not 0 <= args.replay_start_size <= args.buffer_size:
-        raise ValueError("--buffer-size must be positive and --replay-start-size must be between 0 and --buffer-size")
 
 
 def is_game_over(env) -> bool:
@@ -120,7 +88,7 @@ def train(args):
         print(f"\n--> Resuming training from checkpoint: {args.resume}")
         checkpoint_data = read_checkpoint(args.resume, device, trusted=args.trust_checkpoint)
     lr_override = args.lr
-    resolve_training_config(args, checkpoint_data)
+    resolve_training_config(args, checkpoint_data, env="ALE/Pong-v5")
     os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
 
@@ -156,25 +124,10 @@ def train(args):
 
     # Handle Resumption
     if args.resume:
-        agent.load_training_state(checkpoint_data)
-        if lr_override is not None:
-            for group in agent.optimizer.param_groups:
-                group["lr"] = lr_override
-        args.lr = agent.optimizer.param_groups[0]["lr"]
+        restore_training_state(agent, tracker, args, checkpoint_data, lr_override=lr_override)
         # Counters continue the epsilon schedule and target sync cadence.
         start_step = agent.env_steps + 1
         episode_count = checkpoint_data.get("episode_count", 0)
-
-        # Restore metric tracker history so running averages are continuous
-        if "tracker_history" in checkpoint_data:
-            tracker.load(checkpoint_data["tracker_history"])
-
-        # Restore RNG states for exact pseudo-random sequence continuity
-        if "rng_state" in checkpoint_data:
-            try:
-                restore_rng_state(checkpoint_data["rng_state"])
-            except Exception as e:
-                print(f"Note: Could not restore full RNG state ({e}), continuing with fresh RNG.")
 
         print(f"Resumed at Step: {start_step} | Episodes: {episode_count} | Epsilon: {agent.get_epsilon():.3f}")
 

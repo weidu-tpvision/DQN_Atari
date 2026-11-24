@@ -2,11 +2,13 @@
 
 import os
 import random
+import sys
 
+import numpy as np
 import pytest
 import torch
 
-pytest.importorskip("pettingzoo")
+import train_selfplay
 from src.agent import DQNAgent
 from train_selfplay import SnapshotPool
 
@@ -82,3 +84,51 @@ def test_resume_copies_active_opponents_and_restores_results(tmp_path, agent):
     assert all((destination / name).is_file() for name in restored.snapshot_names)
     assert restored.win_rate(previous) == pytest.approx(1 / 3)
     assert restored.next_index == 2
+
+
+def test_selfplay_trains_and_resumes_with_saved_settings(tmp_path, monkeypatch):
+    class ShortMatch:
+        def __init__(self):
+            self.state = np.zeros((4, 84, 84), dtype=np.uint8)
+            self.right_reward = 1.0
+            self.left_reward = -1.0
+            self.truncated = False
+
+        def reset(self, seed=None):
+            return self.observe()
+
+        def step(self, action_right, action_left):
+            return 1, 0, True
+
+        def observe(self):
+            return self.state, self.state
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(train_selfplay, "TwoPlayerPong", ShortMatch)
+    monkeypatch.setattr(train_selfplay, "get_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(train_selfplay.signal, "signal", lambda *_: None)
+
+    def run(directory, *options):
+        monkeypatch.setattr(sys, "argv", ["train_selfplay.py", "--save-dir", str(directory), *options])
+        train_selfplay.main()
+        return torch.load(directory / "latest.pt", weights_only=True)
+
+    source = tmp_path / "source"
+    first = run(
+        source, "--total-steps", "4", "--buffer-size", "6", "--replay-start-size", "2", "--batch-size", "2",
+        "--train-freq", "2", "--gamma", "0.95", "--target-sync-freq", "2", "--no-double-dqn", "--eval-freq", "0",
+        "--lr", "0.0003", "--pool-size", "3", "--opponent-sampling", "uniform", "--latest-prob", "0",
+    )
+    assert first["num_updates"] == 2
+
+    dest = tmp_path / "resumed"
+    resumed = run(dest, "--resume", str(source), "--additional-steps", "2", "--double-dqn")
+    assert resumed["env_steps"] == 6 and resumed["num_updates"] == 3
+    assert resumed["pool_snapshots"] == first["pool_snapshots"]
+    assert all((dest / "pool" / name).is_file() for name in resumed["pool_snapshots"])
+    assert resumed["config"]["double_dqn"] is True
+    assert resumed["optimizer"]["param_groups"][0]["lr"] == 0.0003
+    for option in ("gamma", "target_sync_freq", "eval_freq", "pool_size", "opponent_sampling", "latest_prob"):
+        assert resumed["config"][option] == first["config"][option]

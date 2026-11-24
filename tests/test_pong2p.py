@@ -5,6 +5,7 @@ import pytest
 
 gym = pytest.importorskip("gymnasium")
 ale_py = pytest.importorskip("ale_py")
+pytest.importorskip("multi_agent_ale_py")
 pytest.importorskip("pettingzoo")
 
 from src.pong2p import TwoPlayerPong, process_frame

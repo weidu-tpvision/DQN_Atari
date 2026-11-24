@@ -24,9 +24,10 @@ from src.games.env_2048 import Env2048
 from src.games.symmetry_2048 import augment_batch
 from src.model_2048 import DQN2048
 from src.replay_buffer import ReplayBuffer
-from src.agent import DQNAgent, add_checkpoint_trust_flag
+from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
+from src.training import add_training_arguments, resolve_training_config, restore_training_state
 from src.utils import (
-    MetricTracker, capture_rng_state, configure_exploration, get_device, restore_rng_state, set_seed,
+    MetricTracker, capture_rng_state, configure_exploration, get_device, set_seed,
 )
 
 
@@ -34,22 +35,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train DQN on 2048")
     parser.add_argument("--total-steps", type=int, default=500_000, help="Total environment interaction steps")
     parser.add_argument("--additional-steps", type=int, default=None, help="Train for an additional N steps from checkpoint")
-    parser.add_argument("--buffer-size", type=int, default=100_000, help="Replay buffer capacity")
-    parser.add_argument("--replay-start-size", type=int, default=5_000, help="Warm-up steps before training starts")
-    parser.add_argument("--batch-size", type=int, default=64, help="Minibatch size for SGD")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate (Adam)")
-    parser.add_argument("--eps-start", type=float, help="Initial exploration rate")
-    parser.add_argument("--eps-end", type=float, help="Final exploration rate")
-    parser.add_argument("--eps-decay", type=int, help="Environment steps to decay epsilon to min")
-    parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Target network update frequency (gradient updates)")
-    parser.add_argument("--train-freq", type=int, default=2, help="Agent steps between training updates")
+    add_training_arguments(parser)
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving checkpoints")
     parser.add_argument("--eval-freq", type=int, default=10_000, help="Step interval for greedy policy evaluation")
     parser.add_argument("--eval-episodes", type=int, default=10, help="Number of greedy evaluation episodes (same fixed seeds every time)")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
     parser.add_argument("--save-dir", type=str, default="checkpoints_2048", help="Directory to save checkpoints")
-    parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=True, help="Enable Double DQN")
     parser.add_argument("--action-masking", action=argparse.BooleanOptionalAction, default=None, help="Mask illegal moves")
     parser.add_argument("--reward", choices=["log", "linear"],
                         help="Per-move reward: log2(points gained) or the points gained (game score increment)")
@@ -59,7 +50,6 @@ def parse_args():
                         help="Train on a random one of the 8 board rotations/reflections of each sampled transition")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer on checkpoints")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--replay-path", help="Explicit replay file to use on resume")
     add_checkpoint_trust_flag(parser)
     return parser.parse_args()
@@ -108,9 +98,17 @@ def evaluate_policy(agent: DQNAgent, num_episodes: int = 10, action_masking: boo
 
 
 def train(args):
+    device = get_device()
+    ckpt = {}
+    if args.resume:
+        print(f"\n--> Resuming training from checkpoint: {args.resume}")
+        ckpt = read_checkpoint(args.resume, device, trusted=args.trust_checkpoint)
+    lr_override = args.lr
+    resolve_training_config(
+        args, ckpt, replay_start_size=5_000, batch_size=64, lr=2e-4, train_freq=2, double_dqn=True,
+    )
     os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
-    device = get_device()
 
     # Initialize DQN Agent with custom DQN2048 architecture
     agent = DQNAgent(
@@ -130,22 +128,13 @@ def train(args):
     best_eval_score = -float("inf")
 
     # Resumption
-    ckpt = {}
     if args.resume:
-        print(f"\n--> Resuming training from checkpoint: {args.resume}")
-        ckpt = agent.load(args.resume, trusted=args.trust_checkpoint)
+        restore_training_state(agent, tracker, args, ckpt, lr_override=lr_override)
         start_step = agent.env_steps + 1
         episode_count = ckpt.get("episode_count", 0)
         best_eval_score = ckpt.get("best_eval_score", -float("inf"))
-        if "tracker_history" in ckpt:
-            tracker.load(ckpt["tracker_history"])
-        if "rng_state" in ckpt:
-            try:
-                restore_rng_state(ckpt["rng_state"])
-            except Exception as e:
-                print(f"Note: Could not restore full RNG state ({e}), continuing with fresh RNG.")
     configure_exploration(agent, args, ckpt)
-    saved_config = ckpt.get("config", {})
+    saved_config = ckpt.get("config") or {}
     saved_reward = saved_config.get("reward", "log")
     saved_scale = saved_config.get("reward_scale")
     if saved_scale is None:

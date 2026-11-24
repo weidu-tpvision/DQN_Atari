@@ -40,11 +40,12 @@ from typing import List, Tuple, Dict
 import numpy as np
 import torch
 
-from src.agent import DQNAgent, add_checkpoint_trust_flag
+from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
 from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
 from src.replay_buffer import ReplayBuffer
+from src.training import add_training_arguments, resolve_training_config, restore_training_state
 from src.utils import (
-    MetricTracker, capture_rng_state, configure_exploration, get_device, restore_rng_state, set_seed,
+    MetricTracker, capture_rng_state, configure_exploration, get_device, set_seed,
 )
 
 
@@ -253,40 +254,41 @@ def parse_args():
     parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total environment interaction steps")
     parser.add_argument("--additional-steps", type=int, default=None, help="Train for an additional N steps from checkpoint")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (or directory with latest.pt) to resume self-play from")
-    parser.add_argument("--base-model", type=str, default=None, help="Optional existing checkpoint whose weights initialize the learner")
+    parser.add_argument("--base-model", help="Warm-start from model weights and cap initial epsilon at 0.20")
     parser.add_argument("--replay-path", help="Explicit replay file to use on resume")
-    parser.add_argument("--buffer-size", type=int, default=100_000, help="Replay buffer capacity")
-    parser.add_argument("--replay-start-size", type=int, default=10_000, help="Warm-up steps before SGD starts")
-    parser.add_argument("--batch-size", type=int, default=32, help="Minibatch size for SGD")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (Adam)")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--eps-start", type=float, help="Initial exploration rate (capped at 0.20 with --base-model)")
-    parser.add_argument("--eps-end", type=float, help="Final exploration rate")
-    parser.add_argument("--eps-decay", type=int, help="Environment steps to anneal epsilon from start to end")
-    parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Gradient updates between target network syncs")
-    parser.add_argument("--train-freq", type=int, default=4, help="Environment steps between gradient updates")
+    add_training_arguments(parser)
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving periodic checkpoints")
-    parser.add_argument("--eval-freq", type=int, default=25_000, help="Step interval to evaluate vs pool and promote")
-    parser.add_argument("--eval-matches", type=int, default=20, help="Matches per pool evaluation (more = less noisy promotion)")
-    parser.add_argument("--eval-target-score", type=int, default=7, help="Points needed to win an evaluation match")
+    parser.add_argument("--eval-freq", type=int, help="Step interval to evaluate vs pool and promote (<=0 to disable)")
+    parser.add_argument("--eval-matches", type=int, help="Matches per pool evaluation (more = less noisy promotion)")
+    parser.add_argument("--eval-target-score", type=int, help="Points needed to win an evaluation match")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
-    parser.add_argument("--promotion-threshold", type=float, default=65.0, help="Win rate %% needed to add snapshot to pool")
-    parser.add_argument("--pool-size", type=int, default=50, help="Max active snapshots; oldest retired beyond this (0 = unlimited)")
-    parser.add_argument("--opponent-sampling", type=str, choices=["pfsp", "uniform"], default="pfsp",
+    parser.add_argument("--promotion-threshold", type=float, help="Win rate %% needed to add snapshot to pool")
+    parser.add_argument("--pool-size", type=int, help="Max active snapshots; oldest retired beyond this (0 = unlimited)")
+    parser.add_argument("--opponent-sampling", choices=["pfsp", "uniform"],
                         help="pfsp: favor opponents the learner loses to; uniform: classic fictitious self-play")
-    parser.add_argument("--latest-prob", type=float, default=0.2, help="Probability of playing the newest snapshot")
+    parser.add_argument("--latest-prob", type=float, help="Probability of playing the newest snapshot")
     parser.add_argument("--save-dir", type=str, default="checkpoints_selfplay", help="Directory to save selfplay data")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
-    parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=True, help="Double DQN target calculation")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
     device = get_device()
+    resume_path = args.resume
+    ckpt = {}
+    if resume_path:
+        if os.path.isdir(resume_path):
+            resume_path = os.path.join(resume_path, "latest.pt")
+        print(f"\n--> Resuming Self-Play training from checkpoint: {resume_path}")
+        ckpt = read_checkpoint(resume_path, device, trusted=args.trust_checkpoint)
+    lr_override = args.lr
+    resolve_training_config(
+        args, ckpt, double_dqn=True, eval_freq=25_000, eval_matches=20, eval_target_score=7,
+        promotion_threshold=65.0, pool_size=50, opponent_sampling="pfsp", latest_prob=0.2,
+    )
+    set_seed(args.seed)
 
     os.makedirs(args.save_dir, exist_ok=True)
     pool_dir = os.path.join(args.save_dir, "pool")
@@ -314,7 +316,7 @@ def main():
         device=device,
     )
 
-    configure_exploration(learner, args, warm_start=bool(args.base_model and not args.resume))
+    configure_exploration(learner, args, ckpt, warm_start=bool(args.base_model and not resume_path))
 
     if args.base_model and not args.resume:
         if not os.path.exists(args.base_model):
@@ -335,25 +337,10 @@ def main():
     matches_played = 0
 
     # Handle Resumption
-    if args.resume:
-        resume_path = args.resume
-        if os.path.isdir(resume_path):
-            resume_path = os.path.join(resume_path, "latest.pt")
-        print(f"\n--> Resuming Self-Play training from checkpoint: {resume_path}")
-        # load() restores env_steps (epsilon schedule) and num_updates (target sync) as saved
-        ckpt = learner.load(resume_path, trusted=args.trust_checkpoint)
-        configure_exploration(learner, args, ckpt)
+    if resume_path:
+        restore_training_state(learner, tracker, args, ckpt, lr_override=lr_override)
         global_step = ckpt.get("global_step", learner.env_steps)
         matches_played = ckpt.get("matches_played", 0)
-
-        if "tracker_history" in ckpt:
-            tracker.load(ckpt["tracker_history"])
-
-        if "rng_state" in ckpt:
-            try:
-                restore_rng_state(ckpt["rng_state"])
-            except Exception as e:
-                print(f"Note: Could not restore full RNG state ({e}), continuing with fresh RNG.")
 
         print(f"Resumed at step: {global_step:,} | Matches played so far: {matches_played:,} | Epsilon: {learner.get_epsilon():.3f}")
 
@@ -377,7 +364,7 @@ def main():
         pool_dir, device, max_size=args.pool_size, sampling=args.opponent_sampling,
         latest_prob=args.latest_prob, trusted=args.trust_checkpoint,
     )
-    if args.resume:
+    if resume_path:
         pool.restore(resume_path, ckpt, global_step)
         if not pool.snapshots:
             print("No historical opponent snapshots found. Seeding the pool from the resumed learner.")
@@ -513,7 +500,7 @@ def main():
                     )
 
                 # Periodic Evaluation & Pool Promotion
-                if global_step % args.eval_freq == 0 and len(replay_buffer) >= args.replay_start_size:
+                if args.eval_freq > 0 and global_step % args.eval_freq == 0 and len(replay_buffer) >= args.replay_start_size:
                     eval_res = evaluate_learner_vs_pool(
                         learner, pool,
                         num_matches=args.eval_matches,
@@ -570,6 +557,7 @@ def main():
         "matches_played": matches_played,
         "pool_snapshots": pool.snapshot_names,
         "pool_state": pool.state_dict(),
+        "config": vars(args),
     })
     print(f"\n[DONE] Self-Play training concluded at step {global_step:,}. Final model saved to {final_path}")
     close_files()

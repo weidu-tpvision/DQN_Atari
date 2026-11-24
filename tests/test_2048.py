@@ -153,17 +153,29 @@ def test_train_and_resume_smoke(tmp_path):
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
-    common = ["--replay-start-size", "100", "--buffer-size", "500", "--batch-size", "16", "--eval-freq", "200",
-              "--eval-episodes", "1", "--save-freq", "200", "--log-freq", "100", "--save-dir", str(tmp_path)]
+    common = ["--eval-freq", "0", "--save-dir", str(tmp_path)]
     run = lambda extra: subprocess.run([sys.executable, "train_2048.py", *common, *extra], cwd=root,
                                        capture_output=True, text=True, timeout=300)
-    first = run(["--total-steps", "400"])
+    first = run([
+        "--total-steps", "8", "--replay-start-size", "2", "--buffer-size", "6", "--batch-size", "2",
+        "--train-freq", "2", "--gamma", "0.95", "--target-sync-freq", "2", "--no-double-dqn", "--lr", "0.0003",
+        "--eval-freq", "8", "--eval-episodes", "1", "--save-freq", "8", "--log-freq", "4",
+    ])
     assert first.returncode == 0, first.stderr
-    second = run(["--resume", str(tmp_path / "latest.pt"), "--additional-steps", "200"])
+    assert (tmp_path / "best_model.pt").is_file()
+    latest = tmp_path / "latest.pt"
+    initial = torch.load(latest, weights_only=True)
+    assert initial["num_updates"] == 4
+    second = run(["--resume", str(latest), "--additional-steps", "4", "--lr", "0.0002"])
     assert second.returncode == 0, second.stderr
-    assert "Resumed at step 401" in second.stdout
-    ckpt = torch.load(tmp_path / "latest.pt", weights_only=False)
-    assert ckpt["global_step"] == 600 and ckpt["env_steps"] == 600 and "config" in ckpt
+    assert "Resumed at step 9" in second.stdout and "Replay buffer restored" in second.stdout
+    ckpt = torch.load(latest, weights_only=True)
+    assert ckpt["global_step"] == ckpt["env_steps"] == 12
+    assert ckpt["num_updates"] == 6
+    assert ckpt["config"]["gamma"] == 0.95
+    assert ckpt["config"]["target_sync_freq"] == 2
+    assert ckpt["config"]["double_dqn"] is False
+    assert ckpt["optimizer"]["param_groups"][0]["lr"] == ckpt["config"]["lr"] == 0.0002
 
 
 class TestSymmetry:

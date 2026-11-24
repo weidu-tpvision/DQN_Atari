@@ -28,7 +28,6 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from pettingzoo.atari import pong_v3
 
 NUM_ACTIONS = 6
 RIGHT = "first_0"
@@ -52,6 +51,8 @@ class TwoPlayerPong:
     """PettingZoo pong_v3 with Nature-DQN preprocessing for both paddles."""
 
     def __init__(self, render_mode: Optional[str] = None, noop_max: int = 30, frame_skip: int = 4, stack_k: int = 4):
+        from pettingzoo.atari import pong_v3
+
         self.env = pong_v3.parallel_env(render_mode=render_mode)
         self.noop_max = noop_max
         self.frame_skip = frame_skip

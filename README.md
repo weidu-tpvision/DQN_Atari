@@ -477,9 +477,11 @@ the source. When moving a training checkpoint, keep its associated replay file
 alongside it. Self-play also restores the snapshots listed in the checkpoint from
 the adjacent `pool/` directory. Resume restores the saved epsilon schedule, with
 explicit `--eps-start`, `--eps-end`, and `--eps-decay` flags taking precedence.
-For single-player Atari, saved training settings such as `--gamma`, `--train-freq`,
-`--target-sync-freq`, and Double DQN carry over unless explicitly overridden.
-Use `--no-double-dqn` to switch a Double DQN checkpoint to vanilla DQN.
+All three trainers reuse saved settings such as `--gamma`, `--train-freq`,
+`--target-sync-freq`, and Double DQN. Explicit flags take precedence, including
+`--lr` and `--no-double-dqn`. Self-play also reuses saved opponent sampling,
+pool size, and promotion settings. Checkpoints without a saved setting use the
+trainer default.
 Use `--replay-path` to supply a known matching buffer for an older checkpoint
 that has no replay metadata.
 

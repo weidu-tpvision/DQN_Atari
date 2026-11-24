@@ -8,6 +8,8 @@ from gymnasium.spaces import Discrete
 
 import evaluate
 import train
+import train_2048
+import train_selfplay
 
 
 class ShortAtariEnv:
@@ -52,6 +54,7 @@ def test_training_resume_preserves_config_and_allows_overrides(tmp_path, monkeyp
         "--batch-size", "2", "--double-dqn", "--gamma", "0.95", "--target-sync-freq", "2",
         "--train-freq", "2", "--lr", "0.0003",
     )
+    assert first["num_updates"] == 2
     resume = ("--resume", str(initial_dir / "latest.pt"), "--additional-steps", "2")
     second = run(tmp_path / "resumed", *resume)
     resumed = agents[-1]
@@ -65,12 +68,16 @@ def test_training_resume_preserves_config_and_allows_overrides(tmp_path, monkeyp
     assert agents[-1].optimizer.param_groups[0]["lr"] == 0.0002
 
 
-def test_training_rejects_impossible_warmup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("trainer", [train, train_2048, train_selfplay])
+def test_training_rejects_impossible_warmup(tmp_path, monkeypatch, trainer):
     monkeypatch.setattr(sys, "argv", [
-        "train.py", "--buffer-size", "4", "--replay-start-size", "8", "--save-dir", str(tmp_path / "run"),
+        trainer.__name__, "--buffer-size", "4", "--replay-start-size", "8", "--save-dir", str(tmp_path / "run"),
     ])
     with pytest.raises(ValueError, match="--replay-start-size"):
-        train.train(train.parse_args())
+        if trainer is train_selfplay:
+            trainer.main()
+        else:
+            trainer.train(trainer.parse_args())
     assert not (tmp_path / "run").exists()
 
 
