@@ -17,6 +17,48 @@ def set_seed(seed: int = 42) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+def configure_exploration(agent, args, checkpoint=None, *, warm_start=False) -> None:
+    """Apply explicit CLI options over the checkpoint's effective epsilon schedule."""
+    checkpoint = checkpoint or {}
+    schedule = checkpoint.get("epsilon_schedule")
+    if schedule is None:
+        schedule = dict(checkpoint.get("config", {}))
+        if schedule.get("base_model"):
+            schedule["eps_start"] = min(schedule.get("eps_start", agent.eps_start), 0.20)
+
+    for option, attribute in (
+        ("eps_start", "eps_start"),
+        ("eps_end", "eps_end"),
+        ("eps_decay", "eps_decay_steps"),
+    ):
+        value = getattr(args, option)
+        if value is None:
+            value = schedule.get(option, getattr(agent, attribute))
+        setattr(agent, attribute, value)
+    if warm_start:
+        agent.eps_start = min(agent.eps_start, 0.20)
+
+
+def capture_rng_state() -> dict:
+    numpy_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": (numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state: dict) -> None:
+    random.setstate(state["python"])
+    name, keys, *rest = state["numpy"]
+    np.random.set_state((name, np.asarray(keys, dtype=np.uint32), *rest))
+    if state.get("torch") is not None:
+        torch.set_rng_state(state["torch"].cpu())
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(state["cuda"].cpu())
+
+
 def get_device() -> torch.device:
     """Detect and return the fastest functional PyTorch compute device."""
     if torch.cuda.is_available():
@@ -57,6 +99,9 @@ class MetricTracker:
         if key not in self.history or len(self.history[key]) == 0:
             return 0.0
         return float(np.mean(self.history[key]))
+
+    def state_dict(self) -> dict:
+        return {key: list(values) for key, values in self.history.items()}
 
     def load(self, history: dict) -> None:
         """Restore history from a checkpoint (accepts old unbounded lists)."""

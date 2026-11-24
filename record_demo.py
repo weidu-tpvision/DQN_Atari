@@ -19,7 +19,7 @@ import torch
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
 
 from src.wrappers import make_atari_env
-from src.agent import DQNAgent
+from src.agent import DQNAgent, add_checkpoint_trust_flag
 from src.utils import get_device
 
 
@@ -50,6 +50,7 @@ def parse_args():
     parser.add_argument("--frames", type=int, default=0, help="Max frames (0 = unlimited for human mode, 1500 default for gif/mp4)")
     parser.add_argument("--fps", type=int, default=35, help="Playback FPS")
     parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -66,7 +67,7 @@ def main():
     )
 
     agent = DQNAgent(num_actions=env.action_space.n, device=device)
-    agent.load_weights(args.checkpoint)
+    agent.load_weights(args.checkpoint, trusted=args.trust_checkpoint)
     print(f"Loaded checkpoint from: {args.checkpoint}")
 
     state, _ = env.reset(seed=args.seed)

@@ -10,17 +10,17 @@ Features:
 import os
 import sys
 import time
-import random
 import signal
 import json
 import argparse
 import numpy as np
-import torch
 
 from src.wrappers import make_atari_env
 from src.replay_buffer import ReplayBuffer
-from src.agent import DQNAgent
-from src.utils import set_seed, get_device, MetricTracker
+from src.agent import DQNAgent, add_checkpoint_trust_flag
+from src.utils import (
+    MetricTracker, capture_rng_state, configure_exploration, get_device, restore_rng_state, set_seed,
+)
 
 
 def parse_args():
@@ -33,9 +33,9 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=32, help="Minibatch size for SGD")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (Adam)")
-    parser.add_argument("--eps-start", type=float, default=1.0, help="Initial exploration rate")
-    parser.add_argument("--eps-end", type=float, default=0.02, help="Final exploration rate")
-    parser.add_argument("--eps-decay", type=int, default=1_000_000, help="Environment steps to anneal epsilon from start to end")
+    parser.add_argument("--eps-start", type=float, help="Initial exploration rate")
+    parser.add_argument("--eps-end", type=float, help="Final exploration rate")
+    parser.add_argument("--eps-decay", type=int, help="Environment steps to anneal epsilon from start to end")
     parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Gradient updates between target network syncs")
     parser.add_argument("--train-freq", type=int, default=4, help="Agent steps between training updates")
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving checkpoints")
@@ -50,6 +50,7 @@ def parse_args():
     parser.add_argument("--early-stop-score", type=float, default=None, help="Stop early if mean evaluation score reaches this threshold (None to disable)")
     parser.add_argument("--patience", type=int, default=0, help="Stop early if no improvement over best evaluation score for N evaluations (0 to disable)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -115,9 +116,6 @@ def train(args):
         in_channels=4,
         gamma=args.gamma,
         lr=args.lr,
-        eps_start=args.eps_start,
-        eps_end=args.eps_end,
-        eps_decay_steps=args.eps_decay,
         target_sync_freq=args.target_sync_freq,
         double_dqn=args.double_dqn,
         device=device,
@@ -128,10 +126,13 @@ def train(args):
     episode_count = 0
     checkpoint_data = {}
 
+    configure_exploration(agent, args)
+
     # Handle Resumption
     if args.resume:
         print(f"\n--> Resuming training from checkpoint: {args.resume}")
-        checkpoint_data = agent.load(args.resume)
+        checkpoint_data = agent.load(args.resume, trusted=args.trust_checkpoint)
+        configure_exploration(agent, args, checkpoint_data)
         # load() restores env_steps (epsilon schedule) and num_updates (target sync)
         start_step = agent.env_steps + 1
         episode_count = checkpoint_data.get("episode_count", 0)
@@ -142,37 +143,15 @@ def train(args):
 
         # Restore RNG states for exact pseudo-random sequence continuity
         if "rng_state" in checkpoint_data:
-            rng = checkpoint_data["rng_state"]
             try:
-                random.setstate(rng["python"])
-                np.random.set_state(rng["numpy"])
-                if rng.get("torch") is not None:
-                    torch.set_rng_state(rng["torch"].clone().detach().cpu())
-                if rng.get("cuda") is not None and torch.cuda.is_available():
-                    torch.cuda.set_rng_state(rng["cuda"].clone().detach().cpu())
+                restore_rng_state(checkpoint_data["rng_state"])
             except Exception as e:
                 print(f"Note: Could not restore full RNG state ({e}), continuing with fresh RNG.")
 
         print(f"Resumed at Step: {start_step} | Episodes: {episode_count} | Epsilon: {agent.get_epsilon():.3f}")
 
-        # Check for replay buffer file intelligently:
-        ckpt_dir = os.path.dirname(args.resume) or "."
-        base_no_ext = os.path.splitext(args.resume)[0]
-        step_num = checkpoint_data.get("global_step")
-
-        candidates = [
-            args.replay_path,
-            f"{base_no_ext}_replay.npz",
-            os.path.join(ckpt_dir, f"replay_step_{step_num}.npz") if step_num else None,
-            os.path.join(ckpt_dir, "latest_replay.npz"),
-            os.path.join(args.save_dir, "latest_replay.npz"),
-        ]
-        buffer_file = next((c for c in candidates if c and os.path.exists(c)), None)
-
-        if buffer_file:
-            print(f"Loading replay buffer from {buffer_file}...")
-            replay_buffer.load(buffer_file)
-            print(f"Replay buffer restored with {len(replay_buffer)} transitions.")
+        if replay_buffer.restore_for_checkpoint(args.resume, checkpoint_data, args.replay_path):
+            print(f"Replay buffer restored with {len(replay_buffer):,} transitions.")
         else:
             print("No saved replay buffer file found for this checkpoint.")
             print("Fast-populating buffer using loaded policy to avoid cold-start random noise...")
@@ -245,28 +224,17 @@ def train(args):
             "episode_count": episode_count,
             "best_eval_score": best_eval_score,
             "patience_counter": patience_counter,
-            "tracker_history": tracker.history,
+            "tracker_history": tracker.state_dict(),
             "config": vars(args),
-            "rng_state": {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            },
+            "rng_state": capture_rng_state(),
         }
         # Save model
         name = "latest.pt" if is_latest else f"dqn_{args.env.replace('/', '_')}_step_{step_num}.pt"
         ckpt_path = os.path.join(args.save_dir, name)
-        agent.save(ckpt_path, extra_state=extra)
-        
-        # Save replay buffer for complete resumption
         if args.save_buffer and (is_latest or step_num % 100_000 == 0):
-            buf_name = "latest_replay.npz" if is_latest else f"replay_step_{step_num}.npz"
-            buf_path = os.path.join(args.save_dir, buf_name)
-            replay_buffer.save(buf_path)
-            print(f"--> Saved complete training state & buffer to {ckpt_path} and {buf_path}", flush=True)
-        else:
-            print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
+            extra["replay"] = replay_buffer.save_for_checkpoint(ckpt_path)
+        agent.save(ckpt_path, extra_state=extra)
+        print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
 
     current_step = start_step
     try:

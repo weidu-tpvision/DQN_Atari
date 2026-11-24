@@ -7,6 +7,8 @@ Reference:
 """
 
 import os
+from pathlib import Path
+from uuid import uuid4
 from typing import Tuple
 import numpy as np
 import torch
@@ -80,11 +82,12 @@ class ReplayBuffer:
 
         return states, actions, rewards, next_states, dones
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, *, checkpoint_id: str = "") -> None:
         """Save replay buffer state and arrays to compressed npz file atomically."""
         tmp_path = path + ".tmp.npz"
         np.savez_compressed(
             tmp_path,
+            checkpoint_id=checkpoint_id,
             ptr=self.ptr,
             size=self.size,
             states=self.states[:self.size],
@@ -95,13 +98,20 @@ class ReplayBuffer:
         )
         os.replace(tmp_path, path)
 
-    def load(self, path: str) -> None:
+    def load(self, path: str, *, checkpoint_id: str | None = None) -> None:
         """Load replay buffer state from compressed npz file.
 
         Handles a capacity different from the one the buffer was saved with: the most recent
         min(saved_size, capacity) transitions are kept in chronological order.
         """
-        data = np.load(path)
+        with np.load(path, allow_pickle=False) as data:
+            if checkpoint_id is not None and (
+                "checkpoint_id" not in data or data["checkpoint_id"].item() != checkpoint_id
+            ):
+                raise ValueError(f"Replay file {path} does not match the checkpoint that references it.")
+            self._load_arrays(data)
+
+    def _load_arrays(self, data) -> None:
         saved_ptr = int(data["ptr"])
         loaded_size = len(data["actions"])
         if data["states"].shape[1:] != self.states.shape[1:]:
@@ -125,6 +135,29 @@ class ReplayBuffer:
             getattr(self, k)[:len(keep)] = data[k][keep]
         self.size = len(keep)
         self.ptr = self.size % self.capacity
+
+    def save_for_checkpoint(self, checkpoint_path: str) -> dict:
+        path = Path(checkpoint_path)
+        replay_path = path.with_name(f"{path.stem}_replay.npz")
+        checkpoint_id = uuid4().hex
+        self.save(str(replay_path), checkpoint_id=checkpoint_id)
+        return {"file": replay_path.name, "id": checkpoint_id}
+
+    def restore_for_checkpoint(self, checkpoint_path: str, checkpoint: dict, override: str | None) -> bool:
+        if override is not None:
+            self.load(override)
+            return True
+
+        replay = checkpoint.get("replay")
+        if replay is None:
+            return False
+
+        name = replay["file"]
+        if Path(name).name != name:
+            raise ValueError(f"Invalid replay filename in checkpoint: {name}")
+        replay_path = Path(checkpoint_path).with_name(name)
+        self.load(str(replay_path), checkpoint_id=replay["id"])
+        return True
 
     def __len__(self) -> int:
         return self.size

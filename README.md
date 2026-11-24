@@ -409,6 +409,15 @@ This restores:
 - Python/NumPy/Torch RNG states
 - Replay buffer state (from `latest_replay.npz`; a different `--buffer-size` keeps the newest transitions) or warm-populates using the loaded policy
 
+Checkpoints use PyTorch's restricted loader by default. For older checkpoints that
+contain serialized training state, pass `--trust-checkpoint` only when you trust
+the source. When moving a training checkpoint, keep its associated replay file
+alongside it. Self-play also restores the snapshots listed in the checkpoint from
+the adjacent `pool/` directory. Resume restores the saved epsilon schedule, with
+explicit `--eps-start`, `--eps-end`, and `--eps-decay` flags taking precedence.
+Use `--replay-path` to supply a known matching buffer for an older checkpoint
+that has no replay metadata.
+
 Not restored: the emulator state (a resumed run starts a fresh game) and the ALE's internal RNG,
 so a resumed run is close to, but not bit-identical with, an uninterrupted one.
 
