@@ -22,7 +22,7 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from src.agent import DQNAgent
+from src.agent import DQNAgent, add_checkpoint_trust_flag
 from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
 from src.utils import get_device, set_seed
 
@@ -70,6 +70,7 @@ def parse_args():
     parser.add_argument("--epsilon", type=float, default=0.02, help="Slight exploration (2%%) to prevent infinite deterministic loops")
     parser.add_argument("--base-seed", type=int, default=42, help="RNG seed")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Output directory")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -139,7 +140,7 @@ def main():
     agents = []
     for c in contenders:
         ag = DQNAgent(num_actions=NUM_ACTIONS, device=device)
-        ag.load_weights(c["path"])
+        ag.load_weights(c["path"], trusted=args.trust_checkpoint)
         agents.append(ag)
 
     game = TwoPlayerPong()

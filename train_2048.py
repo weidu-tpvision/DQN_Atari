@@ -13,21 +13,21 @@ import os
 import sys
 import json
 import time
-import random
 import signal
 import argparse
 from typing import Dict, Any
 from collections import deque
 
 import numpy as np
-import torch
 
 from src.games.env_2048 import Env2048
 from src.games.symmetry_2048 import augment_batch
 from src.model_2048 import DQN2048
 from src.replay_buffer import ReplayBuffer
-from src.agent import DQNAgent
-from src.utils import set_seed, get_device, MetricTracker
+from src.agent import DQNAgent, add_checkpoint_trust_flag
+from src.utils import (
+    MetricTracker, capture_rng_state, configure_exploration, get_device, restore_rng_state, set_seed,
+)
 
 
 def parse_args():
@@ -39,9 +39,9 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=64, help="Minibatch size for SGD")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate (Adam)")
-    parser.add_argument("--eps-start", type=float, default=1.0, help="Initial exploration rate")
-    parser.add_argument("--eps-end", type=float, default=0.02, help="Final exploration rate")
-    parser.add_argument("--eps-decay", type=int, default=200_000, help="Environment steps to decay epsilon to min")
+    parser.add_argument("--eps-start", type=float, help="Initial exploration rate")
+    parser.add_argument("--eps-end", type=float, help="Final exploration rate")
+    parser.add_argument("--eps-decay", type=int, help="Environment steps to decay epsilon to min")
     parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Target network update frequency (gradient updates)")
     parser.add_argument("--train-freq", type=int, default=2, help="Agent steps between training updates")
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving checkpoints")
@@ -50,8 +50,8 @@ def parse_args():
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
     parser.add_argument("--save-dir", type=str, default="checkpoints_2048", help="Directory to save checkpoints")
     parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=True, help="Enable Double DQN")
-    parser.add_argument("--action-masking", action=argparse.BooleanOptionalAction, default=True, help="Mask illegal moves")
-    parser.add_argument("--reward", type=str, choices=["log", "linear"], default="log",
+    parser.add_argument("--action-masking", action=argparse.BooleanOptionalAction, default=None, help="Mask illegal moves")
+    parser.add_argument("--reward", choices=["log", "linear"],
                         help="Per-move reward: log2(points gained) or the points gained (game score increment)")
     parser.add_argument("--reward-scale", type=float, default=None,
                         help="Multiplier for the reward (default: 1 for log, 1/1024 for linear)")
@@ -60,6 +60,8 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer on checkpoints")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--replay-path", help="Explicit replay file to use on resume")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -106,11 +108,64 @@ def evaluate_policy(agent: DQNAgent, num_episodes: int = 10, action_masking: boo
 
 
 def train(args):
-    if args.reward_scale is None:
-        args.reward_scale = 1.0 if args.reward == "log" else 1.0 / 1024
     os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
     device = get_device()
+
+    # Initialize DQN Agent with custom DQN2048 architecture
+    agent = DQNAgent(
+        num_actions=4,
+        gamma=args.gamma,
+        lr=args.lr,
+        eps_decay_steps=200_000,
+        target_sync_freq=args.target_sync_freq,
+        double_dqn=args.double_dqn,
+        device=device,
+        model_fn=lambda: DQN2048(in_channels=16, num_actions=4),
+    )
+
+    tracker = MetricTracker(window_size=100)
+    start_step = 1
+    episode_count = 0
+    best_eval_score = -float("inf")
+
+    # Resumption
+    ckpt = {}
+    if args.resume:
+        print(f"\n--> Resuming training from checkpoint: {args.resume}")
+        ckpt = agent.load(args.resume, trusted=args.trust_checkpoint)
+        start_step = agent.env_steps + 1
+        episode_count = ckpt.get("episode_count", 0)
+        best_eval_score = ckpt.get("best_eval_score", -float("inf"))
+        if "tracker_history" in ckpt:
+            tracker.load(ckpt["tracker_history"])
+        if "rng_state" in ckpt:
+            try:
+                restore_rng_state(ckpt["rng_state"])
+            except Exception as e:
+                print(f"Note: Could not restore full RNG state ({e}), continuing with fresh RNG.")
+    configure_exploration(agent, args, ckpt)
+    saved_config = ckpt.get("config", {})
+    saved_reward = saved_config.get("reward", "log")
+    saved_scale = saved_config.get("reward_scale")
+    if saved_scale is None:
+        saved_scale = 1.0 if saved_reward == "log" else 1.0 / 1024
+    if args.reward is None:
+        args.reward = saved_reward
+    if args.reward_scale is None:
+        args.reward_scale = saved_scale if args.reward == saved_reward else (1.0 if args.reward == "log" else 1.0 / 1024)
+    saved_masking = saved_config.get("action_masking", True)
+    if args.action_masking is None:
+        args.action_masking = saved_masking
+
+    if args.additional_steps is not None:
+        target_total_steps = (start_step - 1) + args.additional_steps
+    else:
+        target_total_steps = args.total_steps
+
+    if start_step > target_total_steps:
+        print(f"Checkpoint already reached step {start_step - 1:,}. Nothing to train.")
+        return
 
     print(f"\n=======================================================")
     print(f"             2048 DQN TRAINING ENGINE                  ")
@@ -132,24 +187,18 @@ def train(args):
         action_mask_dim=4 if args.action_masking else None,
     )
 
-    # Initialize DQN Agent with custom DQN2048 architecture
-    agent = DQNAgent(
-        num_actions=4,
-        gamma=args.gamma,
-        lr=args.lr,
-        eps_start=args.eps_start,
-        eps_end=args.eps_end,
-        eps_decay_steps=args.eps_decay,
-        target_sync_freq=args.target_sync_freq,
-        double_dqn=args.double_dqn,
-        device=device,
-        model_fn=lambda: DQN2048(in_channels=16, num_actions=4),
-    )
-
-    tracker = MetricTracker(window_size=100)
-    start_step = 1
-    episode_count = 0
-    best_eval_score = -float("inf")
+    if args.resume:
+        print(f"Resumed at step {start_step:,} | Episodes: {episode_count:,} | Epsilon: {agent.get_epsilon():.3f}")
+        replay_compatible = (
+            (args.reward, args.reward_scale) == (saved_reward, saved_scale)
+            and (not args.action_masking or saved_masking)
+        )
+        if ckpt.get("replay") and args.replay_path is None and not replay_compatible:
+            print("Reward or action-mask settings changed. Collecting fresh transitions.")
+        elif replay_buffer.restore_for_checkpoint(args.resume, ckpt, args.replay_path):
+            print(f"Replay buffer restored with {len(replay_buffer):,} transitions.")
+        else:
+            print("No associated replay buffer. Collecting fresh transitions.")
 
     # Logging setup
     log_path = os.path.join(args.save_dir, "training.log")
@@ -170,43 +219,6 @@ def train(args):
         eval_csv_file.write("step,mean_score,max_score,mean_moves,highest_tile,pct_256,pct_512,pct_1024,pct_2048,elapsed_seconds\n")
         eval_csv_file.flush()
 
-    # Resumption
-    if args.resume:
-        print(f"\n--> Resuming training from checkpoint: {args.resume}")
-        ckpt = agent.load(args.resume)  # restores env_steps (epsilon schedule) and num_updates
-        start_step = agent.env_steps + 1
-        episode_count = ckpt.get("episode_count", 0)
-        best_eval_score = ckpt.get("best_eval_score", -float("inf"))
-        if "tracker_history" in ckpt:
-            tracker.load(ckpt["tracker_history"])
-        if "rng_state" in ckpt:
-            rng = ckpt["rng_state"]
-            try:
-                random.setstate(rng["python"])
-                np.random.set_state(rng["numpy"])
-                if rng.get("torch") is not None:
-                    torch.set_rng_state(rng["torch"].clone().detach().cpu())
-                if rng.get("cuda") is not None and torch.cuda.is_available():
-                    torch.cuda.set_rng_state(rng["cuda"].clone().detach().cpu())
-            except Exception as e:
-                print(f"Note: Could not restore full RNG state ({e}), continuing with fresh RNG.")
-        print(f"Resumed at step {start_step:,} | Episodes: {episode_count:,} | Epsilon: {agent.get_epsilon():.3f}")
-
-        # Restore replay buffer
-        buf_cand = [
-            os.path.join(os.path.dirname(args.resume), "latest_replay.npz"),
-            os.path.join(args.save_dir, "latest_replay.npz"),
-        ]
-        buf_file = next((b for b in buf_cand if os.path.exists(b)), None)
-        if buf_file:
-            print(f"Restoring replay buffer from {buf_file}...")
-            replay_buffer.load(buf_file)
-
-    if args.additional_steps is not None:
-        target_total_steps = (start_step - 1) + args.additional_steps
-    else:
-        target_total_steps = args.total_steps
-
     interrupted = False
     def sigint_handler(signum, frame):
         nonlocal interrupted
@@ -220,26 +232,16 @@ def train(args):
             "global_step": step_num,
             "episode_count": episode_count,
             "best_eval_score": best_eval_score,
-            "tracker_history": tracker.history,
+            "tracker_history": tracker.state_dict(),
             "config": vars(args),
-            "rng_state": {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            },
+            "rng_state": capture_rng_state(),
         }
         name = "latest.pt" if is_latest else f"dqn_2048_step_{step_num}.pt"
         ckpt_path = os.path.join(args.save_dir, name)
-        agent.save(ckpt_path, extra_state=extra)
-
         if args.save_buffer and (is_latest or step_num % 100_000 == 0):
-            buf_name = "latest_replay.npz" if is_latest else f"replay_step_{step_num}.npz"
-            buf_path = os.path.join(args.save_dir, buf_name)
-            replay_buffer.save(buf_path)
-            print(f"--> Saved checkpoint & replay buffer to {ckpt_path} and {buf_path}", flush=True)
-        else:
-            print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
+            extra["replay"] = replay_buffer.save_for_checkpoint(ckpt_path)
+        agent.save(ckpt_path, extra_state=extra)
+        print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
 
     # The game in progress isn't checkpointed, so a resumed run starts a fresh (differently seeded) game
     state, info = env.reset(seed=args.seed + start_step - 1)

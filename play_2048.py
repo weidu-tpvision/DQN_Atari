@@ -18,7 +18,7 @@ import torch
 from src.games.game_2048 import Game2048
 from src.games.env_2048 import Env2048
 from src.model_2048 import DQN2048
-from src.agent import DQNAgent
+from src.agent import DQNAgent, add_checkpoint_trust_flag
 from src.utils import get_device
 
 # ANSI color codes for 2048 tiles
@@ -126,7 +126,7 @@ def play_human():
         print("\nExiting.")
 
 
-def play_ai(checkpoint_path: str, delay: float = 0.15):
+def play_ai(checkpoint_path: str, delay: float = 0.15, *, trusted: bool = False):
     """Watch trained DQN agent play 2048."""
     device = get_device()
     agent = DQNAgent(
@@ -135,7 +135,7 @@ def play_ai(checkpoint_path: str, delay: float = 0.15):
         model_fn=lambda: DQN2048(in_channels=16, num_actions=4),
     )
     print(f"Loading trained weights from {checkpoint_path}...")
-    agent.load_weights(checkpoint_path)
+    agent.load_weights(checkpoint_path, trusted=trusted)
 
     env = Env2048()
     obs, info = env.reset()
@@ -173,12 +173,13 @@ def main():
     parser.add_argument("--mode", type=str, choices=["human", "ai"], default="human", help="Play mode")
     parser.add_argument("--checkpoint", type=str, default="checkpoints_2048/best_model.pt", help="Path to checkpoint for AI mode")
     parser.add_argument("--delay", type=float, default=0.15, help="Step delay in seconds for AI mode")
+    add_checkpoint_trust_flag(parser)
     args = parser.parse_args()
 
     if args.mode == "human":
         play_human()
     else:
-        play_ai(args.checkpoint, delay=args.delay)
+        play_ai(args.checkpoint, delay=args.delay, trusted=args.trust_checkpoint)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import torch
 import gymnasium as gym
 
 from src.wrappers import make_atari_env
-from src.agent import DQNAgent
+from src.agent import DQNAgent, add_checkpoint_trust_flag
 from src.utils import set_seed, get_device
 
 
@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--record", action="store_true", help="Whether to record video of evaluation")
     parser.add_argument("--epsilon", type=float, default=0.0, help="Random-action probability during evaluation (Nature 2015 used 0.05)")
     parser.add_argument("--seed", type=int, default=123, help="Random seed")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -50,7 +51,7 @@ def evaluate(args):
 
     num_actions = env.action_space.n
     agent = DQNAgent(num_actions=num_actions, device=device)
-    agent.load(args.checkpoint)
+    agent.load_weights(args.checkpoint, trusted=args.trust_checkpoint)
     print(f"Loaded checkpoint: {args.checkpoint}")
 
     scores = []

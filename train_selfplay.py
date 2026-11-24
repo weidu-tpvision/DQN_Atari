@@ -26,10 +26,12 @@ Usage:
 import os
 import sys
 import time
-import glob
+import filecmp
+import re
+import shutil
+from pathlib import Path
 import json
 import random
-import re
 import signal
 import argparse
 from collections import deque
@@ -38,10 +40,12 @@ from typing import List, Tuple, Dict
 import numpy as np
 import torch
 
-from src.agent import DQNAgent
+from src.agent import DQNAgent, add_checkpoint_trust_flag
 from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
 from src.replay_buffer import ReplayBuffer
-from src.utils import set_seed, get_device, MetricTracker
+from src.utils import (
+    MetricTracker, capture_rng_state, configure_exploration, get_device, restore_rng_state, set_seed,
+)
 
 
 def _snapshot_index(path: str) -> int:
@@ -65,7 +69,7 @@ class SnapshotPool:
     """
 
     def __init__(self, pool_dir: str, device: torch.device, max_size: int = 50, sampling: str = "pfsp",
-                 latest_prob: float = 0.2, result_window: int = 20):
+                 latest_prob: float = 0.2, result_window: int = 20, *, trusted: bool = False):
         self.pool_dir = pool_dir
         self.device = device
         self.max_size = max_size
@@ -73,12 +77,55 @@ class SnapshotPool:
         self.latest_prob = latest_prob
         self.result_window = result_window
         os.makedirs(pool_dir, exist_ok=True)
-        files = sorted(glob.glob(os.path.join(pool_dir, "snapshot_*.pt")), key=_snapshot_index)
+        files = sorted(Path(pool_dir).glob("snapshot_*.pt"), key=_snapshot_index)
         self.next_index = _snapshot_index(files[-1]) + 1 if files else 0
-        self.snapshots: List[str] = files[-max_size:] if max_size > 0 else files
+        self.trusted = trusted
+        self.snapshots: List[str] = [str(path) for path in (files[-max_size:] if max_size > 0 else files)]
         self.loaded_agents: Dict[str, DQNAgent] = {}
         # Recent match results of the learner against each snapshot: 1 win, 0.5 draw, 0 loss
         self.results: Dict[str, deque] = {}
+
+    @property
+    def snapshot_names(self) -> List[str]:
+        return [os.path.basename(path) for path in self.snapshots]
+
+    def restore(self, checkpoint_path: str, checkpoint: dict, step: int) -> None:
+        source_dir = Path(checkpoint_path).resolve().parent / "pool"
+        names = checkpoint.get("pool_snapshots")
+        if names is None:
+            # Legacy checkpoints only recorded the count. Exclude later promotions.
+            snapshots = []
+            for source in source_dir.glob("snapshot_*.pt"):
+                match = re.fullmatch(r"snapshot_(\d+)_step_(\d+)\.pt", source.name)
+                if match and int(match[2]) <= step:
+                    snapshots.append((int(match[1]), int(match[2]), source.name))
+            names = [name for _, _, name in sorted(snapshots)]
+            count = checkpoint.get("pool_size", len(names))
+            names = names[-count:] if count else []
+
+        target_dir = Path(self.pool_dir).resolve()
+        restored = []
+        if self.max_size > 0:
+            names = names[-self.max_size:]
+        for name in names:
+            if not re.fullmatch(r"snapshot_\d+_step_\d+\.pt", name):
+                raise ValueError(f"Invalid opponent snapshot filename: {name}")
+            source = source_dir / name
+            target = target_dir / name
+            if not source.is_file():
+                raise FileNotFoundError(f"Missing opponent snapshot listed in checkpoint: {source}")
+            if source != target:
+                if not target.exists():
+                    temporary = target.with_suffix(".pt.tmp")
+                    shutil.copyfile(source, temporary)
+                    os.replace(temporary, target)
+                elif not filecmp.cmp(source, target, shallow=False):
+                    raise FileExistsError(f"Opponent snapshot differs from the checkpoint's copy: {target}")
+            restored.append(str(target))
+            self.next_index = max(self.next_index, _snapshot_index(name) + 1)
+        self.snapshots = restored
+        self.loaded_agents.clear()
+        self.load_state_dict(checkpoint.get("pool_state", {}))
 
     def add_snapshot(self, agent: DQNAgent, step: int) -> str:
         """Save the learner's current weights into the pool, retiring the oldest if over the cap."""
@@ -127,7 +174,7 @@ class SnapshotPool:
         # Cache loaded agents for fast switching
         if chosen_path not in self.loaded_agents:
             opp = DQNAgent(num_actions=NUM_ACTIONS, device=self.device)
-            opp.load_weights(chosen_path)
+            opp.load_weights(chosen_path, trusted=self.trusted)
             opp.online_net.eval()
             self.loaded_agents[chosen_path] = opp
 
@@ -207,14 +254,15 @@ def parse_args():
     parser.add_argument("--additional-steps", type=int, default=None, help="Train for an additional N steps from checkpoint")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (or directory with latest.pt) to resume self-play from")
     parser.add_argument("--base-model", type=str, default=None, help="Optional existing checkpoint whose weights initialize the learner")
+    parser.add_argument("--replay-path", help="Explicit replay file to use on resume")
     parser.add_argument("--buffer-size", type=int, default=100_000, help="Replay buffer capacity")
     parser.add_argument("--replay-start-size", type=int, default=10_000, help="Warm-up steps before SGD starts")
     parser.add_argument("--batch-size", type=int, default=32, help="Minibatch size for SGD")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (Adam)")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--eps-start", type=float, default=1.0, help="Initial exploration rate (capped at 0.20 with --base-model)")
-    parser.add_argument("--eps-end", type=float, default=0.02, help="Final exploration rate")
-    parser.add_argument("--eps-decay", type=int, default=1_000_000, help="Environment steps to anneal epsilon from start to end")
+    parser.add_argument("--eps-start", type=float, help="Initial exploration rate (capped at 0.20 with --base-model)")
+    parser.add_argument("--eps-end", type=float, help="Final exploration rate")
+    parser.add_argument("--eps-decay", type=int, help="Environment steps to anneal epsilon from start to end")
     parser.add_argument("--target-sync-freq", type=int, default=1_000, help="Gradient updates between target network syncs")
     parser.add_argument("--train-freq", type=int, default=4, help="Environment steps between gradient updates")
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving periodic checkpoints")
@@ -231,6 +279,7 @@ def parse_args():
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
     parser.add_argument("--double-dqn", action=argparse.BooleanOptionalAction, default=True, help="Double DQN target calculation")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -255,33 +304,24 @@ def main():
     print(f"-------------------------------------------------------\n")
 
     # Initialize Learner
-    eps_start = args.eps_start if not args.base_model else min(args.eps_start, 0.20)
     learner = DQNAgent(
         num_actions=NUM_ACTIONS,
         in_channels=4,
         gamma=args.gamma,
         lr=args.lr,
-        eps_start=eps_start,
-        eps_end=args.eps_end,
-        eps_decay_steps=args.eps_decay,
         target_sync_freq=args.target_sync_freq,
         double_dqn=args.double_dqn,
         device=device,
     )
+
+    configure_exploration(learner, args, warm_start=bool(args.base_model and not args.resume))
 
     if args.base_model and not args.resume:
         if not os.path.exists(args.base_model):
             sys.exit(f"Base model not found: {args.base_model}")
         # Weights only: keep a fresh optimizer and counters so the epsilon schedule starts at eps_start
         print(f"Loading initial policy weights from base model: {args.base_model}")
-        learner.load_weights(args.base_model)
-
-    # Initialize Pool
-    pool = SnapshotPool(pool_dir=pool_dir, device=device, max_size=args.pool_size,
-                        sampling=args.opponent_sampling, latest_prob=args.latest_prob)
-    if not pool.snapshots:
-        # Seed pool with initial learner snapshot M_0
-        pool.add_snapshot(learner, step=0)
+        learner.load_weights(args.base_model, trusted=args.trust_checkpoint)
 
     # Initialize Replay Buffer
     replay_buffer = ReplayBuffer(
@@ -301,39 +341,26 @@ def main():
             resume_path = os.path.join(resume_path, "latest.pt")
         print(f"\n--> Resuming Self-Play training from checkpoint: {resume_path}")
         # load() restores env_steps (epsilon schedule) and num_updates (target sync) as saved
-        ckpt = learner.load(resume_path)
-        global_step = ckpt.get("global_step", 0)
+        ckpt = learner.load(resume_path, trusted=args.trust_checkpoint)
+        configure_exploration(learner, args, ckpt)
+        global_step = ckpt.get("global_step", learner.env_steps)
         matches_played = ckpt.get("matches_played", 0)
 
         if "tracker_history" in ckpt:
             tracker.load(ckpt["tracker_history"])
-        if "pool_state" in ckpt:
-            pool.load_state_dict(ckpt["pool_state"])
 
         if "rng_state" in ckpt:
-            rng = ckpt["rng_state"]
             try:
-                random.setstate(rng["python"])
-                np.random.set_state(rng["numpy"])
-                if rng.get("torch") is not None:
-                    torch.set_rng_state(rng["torch"].clone().detach().cpu())
-                if rng.get("cuda") is not None and torch.cuda.is_available():
-                    torch.cuda.set_rng_state(rng["cuda"].clone().detach().cpu())
+                restore_rng_state(ckpt["rng_state"])
             except Exception as e:
                 print(f"Note: Could not restore full RNG state ({e}), continuing with fresh RNG.")
 
         print(f"Resumed at step: {global_step:,} | Matches played so far: {matches_played:,} | Epsilon: {learner.get_epsilon():.3f}")
 
-        # Try to restore replay buffer
-        buffer_cand = [
-            os.path.join(os.path.dirname(resume_path), "latest_replay.npz"),
-            os.path.join(args.save_dir, "latest_replay.npz"),
-        ]
-        buf_file = next((b for b in buffer_cand if os.path.exists(b)), None)
-        if buf_file:
-            print(f"Loading replay buffer from {buf_file}...")
-            replay_buffer.load(buf_file)
+        if replay_buffer.restore_for_checkpoint(resume_path, ckpt, args.replay_path):
             print(f"Replay buffer restored with {len(replay_buffer):,} transitions.")
+        else:
+            print("No associated replay buffer. Collecting fresh transitions.")
 
     # Determine target total steps
     if args.additional_steps is not None:
@@ -345,6 +372,17 @@ def main():
     if global_step >= target_total_steps:
         print(f"[INFO] Current step ({global_step:,}) already meets or exceeds target steps ({target_total_steps:,}).")
         return
+
+    pool = SnapshotPool(
+        pool_dir, device, max_size=args.pool_size, sampling=args.opponent_sampling,
+        latest_prob=args.latest_prob, trusted=args.trust_checkpoint,
+    )
+    if args.resume:
+        pool.restore(resume_path, ckpt, global_step)
+        if not pool.snapshots:
+            print("No historical opponent snapshots found. Seeding the pool from the resumed learner.")
+    if not pool.snapshots:
+        pool.add_snapshot(learner, step=global_step)
 
     # Logging setup
     log_file = open(os.path.join(args.save_dir, "selfplay_training.log"), "a", buffering=1)
@@ -384,28 +422,18 @@ def main():
         extra = {
             "global_step": step_num,
             "matches_played": matches_played,
-            "pool_size": len(pool.snapshots),
             "pool_state": pool.state_dict(),
-            "tracker_history": tracker.history,
+            "pool_snapshots": pool.snapshot_names,
+            "tracker_history": tracker.state_dict(),
             "config": vars(args),
-            "rng_state": {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            },
+            "rng_state": capture_rng_state(),
         }
         name = "latest.pt" if is_latest else f"dqn_selfplay_step_{step_num}.pt"
         ckpt_path = os.path.join(args.save_dir, name)
-        learner.save(ckpt_path, extra_state=extra)
-
         if args.save_buffer and (is_latest or step_num % 100_000 == 0):
-            buf_name = "latest_replay.npz" if is_latest else f"replay_step_{step_num}.npz"
-            buf_path = os.path.join(args.save_dir, buf_name)
-            replay_buffer.save(buf_path)
-            print(f"--> Saved self-play state & buffer to {ckpt_path} and {buf_path}", flush=True)
-        else:
-            print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
+            extra["replay"] = replay_buffer.save_for_checkpoint(ckpt_path)
+        learner.save(ckpt_path, extra_state=extra)
+        print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
 
     t0 = time.time()
     session_start_step = global_step
@@ -538,7 +566,12 @@ def main():
         sys.exit(0)
 
     final_path = os.path.join(args.save_dir, "selfplay_final.pt")
-    learner.save(final_path, {"global_step": global_step, "matches_played": matches_played})
+    learner.save(final_path, {
+        "global_step": global_step,
+        "matches_played": matches_played,
+        "pool_snapshots": pool.snapshot_names,
+        "pool_state": pool.state_dict(),
+    })
     print(f"\n[DONE] Self-Play training concluded at step {global_step:,}. Final model saved to {final_path}")
     close_files()
 

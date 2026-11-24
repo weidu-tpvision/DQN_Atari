@@ -36,7 +36,7 @@ import torch
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-from src.agent import DQNAgent
+from src.agent import DQNAgent, add_checkpoint_trust_flag
 from src.pong2p import TwoPlayerPong, NUM_ACTIONS
 from src.utils import get_device
 
@@ -282,6 +282,7 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8080, help="Web server port (for web mode)")
     parser.add_argument("--fps", type=int, default=35, help="Playback speed for X11 mode")
     parser.add_argument("--target-score", type=int, default=11, help="Points needed to win a match (default: 11)")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -303,7 +304,7 @@ def main():
 
     # Load AI
     ai_agent = DQNAgent(num_actions=NUM_ACTIONS, device=device)
-    ai_agent.load_weights(args.ai_checkpoint)
+    ai_agent.load_weights(args.ai_checkpoint, trusted=args.trust_checkpoint)
 
     game = TwoPlayerPong(render_mode="rgb_array")
     ai_state, _ = game.reset(seed=42)

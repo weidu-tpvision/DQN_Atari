@@ -14,11 +14,31 @@ Counters:
 """
 
 import os
+import pickle
 from typing import Callable, Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
 from src.model import NatureDQN
+
+
+def add_checkpoint_trust_flag(parser):
+    parser.add_argument(
+        "--trust-checkpoint", action="store_true",
+        help="Permit legacy pickle loading only for checkpoints you trust",
+    )
+
+
+def read_checkpoint(path: str, device: torch.device, *, trusted: bool = False):
+    try:
+        return torch.load(path, map_location=device, weights_only=not trusted)
+    except pickle.UnpicklingError as exc:
+        if trusted:
+            raise
+        raise ValueError(
+            f"Restricted loading failed for {path}. For a legacy checkpoint from "
+            "a trusted source, pass --trust-checkpoint."
+        ) from exc
 
 
 class DQNAgent:
@@ -195,6 +215,11 @@ class DQNAgent:
             "optimizer": self.optimizer.state_dict(),
             "env_steps": self.env_steps,
             "num_updates": self.num_updates,
+            "epsilon_schedule": {
+                "eps_start": self.eps_start,
+                "eps_end": self.eps_end,
+                "eps_decay": self.eps_decay_steps,
+            },
         }
         if extra_state:
             checkpoint.update(extra_state)
@@ -209,9 +234,9 @@ class DQNAgent:
         torch.save({"online_net": self.online_net.state_dict()}, tmp_path)
         os.replace(tmp_path, path)
 
-    def load(self, path: str) -> dict:
+    def load(self, path: str, *, trusted: bool = False) -> dict:
         """Load full training state (weights, optimizer, counters) and return the checkpoint dict."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = read_checkpoint(path, self.device, trusted=trusted)
         self.online_net.load_state_dict(checkpoint["online_net"])
         self.target_net.load_state_dict(checkpoint.get("target_net", checkpoint["online_net"]))
         if "optimizer" in checkpoint:
@@ -221,9 +246,9 @@ class DQNAgent:
         self.env_steps = checkpoint.get("env_steps", checkpoint.get("global_step", 0))
         return checkpoint
 
-    def load_weights(self, path: str) -> None:
+    def load_weights(self, path: str, *, trusted: bool = False) -> None:
         """Load only network weights (fresh optimizer and counters), e.g. to warm-start or to play."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = read_checkpoint(path, self.device, trusted=trusted)
         state_dict = checkpoint["online_net"] if "online_net" in checkpoint else checkpoint
         self.online_net.load_state_dict(state_dict)
         self.sync_target_network()

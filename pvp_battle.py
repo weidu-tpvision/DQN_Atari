@@ -24,7 +24,7 @@ import argparse
 import numpy as np
 import cv2
 
-from src.agent import DQNAgent
+from src.agent import DQNAgent, add_checkpoint_trust_flag
 from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
 from src.utils import get_device, set_seed
 
@@ -52,6 +52,7 @@ def parse_args():
     parser.add_argument("--output", type=str, default="pvp_battle.gif", help="Output file path for gif/mp4")
     parser.add_argument("--swap-sides", action=argparse.BooleanOptionalAction, default=True, help="Alternate paddle sides between matches for fair play")
     parser.add_argument("--seed", type=int, default=200, help="Base seed for match resets and epsilon noise")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -75,10 +76,10 @@ def main():
 
     # Load both agents
     agent1 = DQNAgent(num_actions=NUM_ACTIONS, device=device)
-    agent1.load_weights(args.p1)
+    agent1.load_weights(args.p1, trusted=args.trust_checkpoint)
 
     agent2 = DQNAgent(num_actions=NUM_ACTIONS, device=device)
-    agent2.load_weights(args.p2)
+    agent2.load_weights(args.p2, trusted=args.trust_checkpoint)
 
     display_action_map = {0: "NOOP", 1: "FIRE", 2: "UP", 3: "DOWN", 4: "UPFIRE", 5: "DOWNFIRE"}
 

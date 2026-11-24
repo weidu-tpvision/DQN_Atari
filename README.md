@@ -385,6 +385,11 @@ A single-player puzzle (no opponent, so no self-play) solved with the same `DQNA
 
 Evaluation uses the same fixed seeds every time, so `best_model.pt` is chosen on comparable scores.
 
+When resuming 2048 training, the checkpoint restores the exploration schedule,
+reward, and action masking settings. Replay is restored from the matching sidecar.
+For legacy training checkpoints from a trusted source, use `--trust-checkpoint`
+and pass the matching replay file explicitly with `--replay-path`.
+
 Options that matter most for reaching big tiles (a 2048 tile takes ~1,000 moves):
 - `--reward {log,linear}` / `--reward-scale` (default 1 for log, 1/1024 for linear). With
   discounting, log reward makes distant big merges almost worthless (a 2048 merge 500 moves away is
@@ -470,6 +475,15 @@ This restores:
 - Best evaluation score and early-stopping patience counter
 - Python/NumPy/Torch RNG states
 - Replay buffer state (from `latest_replay.npz`; a different `--buffer-size` keeps the newest transitions) or warm-populates using the loaded policy
+
+Checkpoints use PyTorch's restricted loader by default. For older checkpoints that
+contain serialized training state, pass `--trust-checkpoint` only when you trust
+the source. When moving a training checkpoint, keep its associated replay file
+alongside it. Self-play also restores the snapshots listed in the checkpoint from
+the adjacent `pool/` directory. Resume restores the saved epsilon schedule, with
+explicit `--eps-start`, `--eps-end`, and `--eps-decay` flags taking precedence.
+Use `--replay-path` to supply a known matching buffer for an older checkpoint
+that has no replay metadata.
 
 Not restored: the emulator state (a resumed run starts a fresh game) and the ALE's internal RNG,
 so a resumed run is close to, but not bit-identical with, an uninterrupted one.

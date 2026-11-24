@@ -26,7 +26,7 @@ import pandas as pd
 import torch
 
 from src.wrappers import make_atari_env
-from src.agent import DQNAgent
+from src.agent import DQNAgent, add_checkpoint_trust_flag
 from src.utils import get_device
 
 
@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument("--base-seed", type=int, default=100, help="Base seed (identical across models)")
     parser.add_argument("--output-csv", type=str, default="checkpoints/tournament_results.csv", help="Output CSV path")
     parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True, help="Generate leaderboard visualization")
+    add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
@@ -133,7 +134,7 @@ def main():
         print(f">>> [{c_idx}/{len(ckpt_list)}] Benchmarking: {name} ...", flush=True)
 
         try:
-            agent.load(ckpt_path)
+            agent.load_weights(ckpt_path, trusted=args.trust_checkpoint)
         except Exception as e:
             print(f"    Failed to load {ckpt_path}: {e}")
             continue

@@ -63,3 +63,22 @@ def test_pool_state_round_trip_drops_retired(tmp_path, agent):
     restored.load_state_dict(state)
     assert set(restored.results) == {os.path.basename(b)}
     assert restored.win_rate(b) == pytest.approx(1 / 3)
+
+
+def test_resume_copies_active_opponents_and_restores_results(tmp_path, agent):
+    source = tmp_path / "source"
+    original = SnapshotPool(str(source / "pool"), torch.device("cpu"), max_size=2)
+    original.add_snapshot(agent, 0)
+    previous = original.add_snapshot(agent, 1)
+    original.record_result(previous, 0.0)
+    checkpoint = {"pool_snapshots": original.snapshot_names, "pool_state": original.state_dict()}
+    original.add_snapshot(agent, 2)
+
+    destination = tmp_path / "destination" / "pool"
+    restored = SnapshotPool(str(destination), torch.device("cpu"), max_size=2)
+    restored.restore(str(source / "latest.pt"), checkpoint, step=1)
+
+    assert restored.snapshot_names == checkpoint["pool_snapshots"]
+    assert all((destination / name).is_file() for name in restored.snapshot_names)
+    assert restored.win_rate(previous) == pytest.approx(1 / 3)
+    assert restored.next_index == 2
