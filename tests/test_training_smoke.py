@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -32,7 +33,10 @@ def test_atari_train_and_resume_makes_optimizer_updates(tmp_path, script, enviro
             cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", timeout=90,
         )
         assert result.returncode == 0, result.stdout + result.stderr
-        return torch.load(latest, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(latest, map_location="cpu", weights_only=True)
+        with np.load(tmp_path / checkpoint["replay"]["file"], allow_pickle=False) as replay:
+            assert "atari_replay_version" in replay.files
+        return checkpoint
 
     first = run(
         *environment_options, "--total-steps", "8", "--buffer-size", "6",
@@ -40,9 +44,7 @@ def test_atari_train_and_resume_makes_optimizer_updates(tmp_path, script, enviro
     )
     assert first["env_steps"] == 8 and first["num_updates"] == 4
     assert first["optimizer"]["state"]
-    assert (tmp_path / first["replay"]["file"]).is_file()
 
     resumed = run("--resume", str(latest), "--additional-steps", "4")
     assert resumed["env_steps"] == 12 and resumed["num_updates"] == 6
     assert resumed["config"]["buffer_size"] == 6
-    assert (tmp_path / resumed["replay"]["file"]).is_file()

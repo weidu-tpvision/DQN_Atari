@@ -43,8 +43,8 @@ import numpy as np
 import torch
 
 from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
+from src.atari_replay import AtariReplayBuffer
 from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
-from src.replay_buffer import ReplayBuffer
 from src.training import add_training_arguments, resolve_training_config, restore_training_state
 from src.utils import (
     MetricTracker, capture_rng_state, configure_exploration, get_device, set_seed,
@@ -392,7 +392,7 @@ def main():
         learner.load_weights(args.base_model, trusted=args.trust_checkpoint)
 
     # Initialize Replay Buffer
-    replay_buffer = ReplayBuffer(
+    replay_buffer = AtariReplayBuffer(
         capacity=args.buffer_size,
         state_shape=(4, 84, 84),
         device=device,

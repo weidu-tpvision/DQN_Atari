@@ -12,7 +12,7 @@ A high-performance, modular, and readable PyTorch implementation of the landmark
 - **Nature 2015 CNN Architecture**: 3 convolutional layers ($8\times 8$ stride 4, $4\times 4$ stride 2, $3\times 3$ stride 1) followed by a 512-unit fully connected layer and linear Q-value heads.
 - **Gymnasium + ALE Atari Integration**: Clean, modern environment wrappers handling frame skipping ($k=4$), sprite flicker removal (max-pooling over 2 frames), grayscale conversion, downsampling ($84\times 84$), frame stacking ($k=4$), and reward clipping ($\{-1, 0, +1\}$).
 - **Episodic Life Loss**: End-of-life treated as terminal for Bellman bootstrapping, encouraging survival without forcing an emulator reset.
-- **Compact Experience Replay**: Observations stored as `uint8` arrays (normalized on the GPU), with fast vectorized sampling.
+- **Compact Atari Replay**: Stores the newest `uint8` frame per transition and reconstructs both observation stacks when sampling. At 100,000 transitions, the dense frame ring takes about 706 MB plus reset history and metadata.
 - **Huber Loss (Smooth L1)**: Matches the paper's $[-1, 1]$ TD-error gradient clipping for numerical stability.
 - **Frozen Target Network ($\theta^-$)**: Hard-sync every $C$ gradient updates to eliminate moving-target feedback loops.
 
@@ -64,6 +64,7 @@ atari/
 │   ├── wrappers.py                 # Preprocessing & frame stacking wrappers
 │   ├── pong2p.py                   # Shared 2-player Pong (PettingZoo) pipeline for all PvP/self-play scripts
 │   ├── replay_buffer.py            # Vectorized uint8 circular replay buffer with atomic serialization
+│   ├── atari_replay.py             # Frame-based replay for Atari and Pong self-play
 │   ├── agent.py                    # DQNAgent: Double DQN, Huber loss, target sync, atomic saving
 │   └── utils.py                    # Seeding, GPU/device detection, metric tracker
 ├── tests/                          # Unit, CLI and web-server tests (pytest)
@@ -531,6 +532,8 @@ the source. When moving a training checkpoint, keep its associated replay file
 alongside it. Self-play also restores the snapshots listed in the checkpoint from
 the adjacent `pool/` directory. Resume restores the saved epsilon schedule, with
 explicit `--eps-start`, `--eps-end`, and `--eps-decay` flags taking precedence.
+Atari and self-play can load legacy snapshots that store full observation stacks.
+Resume converts them in chunks, and subsequent Atari replay snapshots use the frame format.
 All three trainers reuse saved settings such as `--gamma`, `--train-freq`,
 `--target-sync-freq`, and Double DQN. Explicit flags take precedence, including
 `--lr` and `--no-double-dqn`. Self-play also reuses saved opponent sampling,

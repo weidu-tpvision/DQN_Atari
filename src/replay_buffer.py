@@ -41,14 +41,17 @@ class ReplayBuffer:
         self.device = device
         self.ptr = 0
         self.size = 0
+        self.state_shape = state_shape
 
-        # Pre-allocate contiguous memory buffers
-        self.states = np.zeros((capacity, *state_shape), dtype=np.uint8)
-        self.next_states = np.zeros((capacity, *state_shape), dtype=np.uint8)
+        self._init_observations()
         self.actions = np.zeros(capacity, dtype=np.int64)
         self.rewards = np.zeros(capacity, dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.bool_)
         self.next_masks = np.ones((capacity, action_mask_dim), dtype=np.bool_) if action_mask_dim else None
+
+    def _init_observations(self) -> None:
+        self.states = np.zeros((self.capacity, *self.state_shape), dtype=np.uint8)
+        self.next_states = np.zeros((self.capacity, *self.state_shape), dtype=np.uint8)
 
     def push(
         self,
@@ -60,16 +63,19 @@ class ReplayBuffer:
         next_mask: Optional[np.ndarray] = None,
     ) -> None:
         """Store a transition (s, a, r, s', done[, legal mask of s']) in the buffer."""
-        self.states[self.ptr] = state
+        self._store_observations(state, next_state)
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
-        self.next_states[self.ptr] = next_state
         self.dones[self.ptr] = done
         if self.next_masks is not None:
             self.next_masks[self.ptr] = True if next_mask is None else next_mask
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+
+    def _store_observations(self, state: np.ndarray, next_state: np.ndarray) -> None:
+        self.states[self.ptr] = state
+        self.next_states[self.ptr] = next_state
 
     def sample(self, batch_size: int = 32) -> Tuple[torch.Tensor, ...]:
         """Sample a uniform random minibatch of transitions.
@@ -80,8 +86,9 @@ class ReplayBuffer:
         """
         indices = np.random.randint(0, self.size, size=batch_size)
 
-        states = torch.as_tensor(self.states[indices], device=self.device)
-        next_states = torch.as_tensor(self.next_states[indices], device=self.device)
+        states, next_states = self._sample_observations(indices)
+        states = torch.as_tensor(states, device=self.device)
+        next_states = torch.as_tensor(next_states, device=self.device)
         actions = torch.as_tensor(self.actions[indices], dtype=torch.int64, device=self.device)
         rewards = torch.as_tensor(self.rewards[indices], dtype=torch.float32, device=self.device)
         dones = torch.as_tensor(self.dones[indices], dtype=torch.bool, device=self.device)
@@ -91,15 +98,21 @@ class ReplayBuffer:
             return states, actions, rewards, next_states, dones, next_masks
         return states, actions, rewards, next_states, dones
 
+    def _sample_observations(self, indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        return self.states[indices], self.next_states[indices]
+
     def save(self, path: str, *, checkpoint_id: str = "") -> None:
         """Save replay buffer state and arrays to compressed npz file atomically."""
         tmp_path = path + ".tmp.npz"
-        arrays = {k: getattr(self, k)[:self.size] for k in self._keys()}
+        arrays = self._snapshot_arrays()
         try:
             np.savez_compressed(tmp_path, checkpoint_id=checkpoint_id, ptr=self.ptr, size=self.size, **arrays)
             os.replace(tmp_path, path)
         finally:
             Path(tmp_path).unlink(missing_ok=True)
+
+    def _snapshot_arrays(self) -> dict:
+        return {key: getattr(self, key)[:self.size] for key in self._keys()}
 
     def load(self, path: str, *, checkpoint_id: str | None = None) -> None:
         """Load replay buffer state from compressed npz file.
@@ -115,6 +128,8 @@ class ReplayBuffer:
             self._load_arrays(data)
 
     def _load_arrays(self, data) -> None:
+        if "states" not in data.files:
+            raise ValueError("Replay snapshot does not contain full observation stacks")
         saved_ptr = int(data["ptr"])
         loaded_size = len(data["actions"])
         if data["states"].shape[1:] != self.states.shape[1:]:

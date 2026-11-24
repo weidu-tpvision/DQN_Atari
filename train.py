@@ -16,7 +16,7 @@ import argparse
 import numpy as np
 
 from src.wrappers import make_atari_env
-from src.replay_buffer import ReplayBuffer
+from src.atari_replay import AtariReplayBuffer
 from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
 from src.training import add_training_arguments, resolve_training_config, restore_training_state
 from src.utils import (
@@ -103,7 +103,7 @@ def train(args):
         print("Double DQN enabled: Action selection via online network, evaluation via target network.")
 
     # Initialize Replay Buffer
-    replay_buffer = ReplayBuffer(
+    replay_buffer = AtariReplayBuffer(
         capacity=args.buffer_size,
         state_shape=(4, 84, 84),
         device=device,
