@@ -78,6 +78,8 @@ atari/
 ├── checkpoints_selfplay/           # Self-play run metrics
 ├── train.py                        # Resumable training loop with crash resilience & atomic saves
 ├── train_selfplay.py               # Fictitious self-play trainer (PettingZoo pong_v3)
+├── train_2048.py / play_2048.py    # DQN for the 2048 puzzle (src/games/, src/model_2048.py)
+├── eval_2048.py                    # Compare 2048 checkpoints on 200 held-out games
 ├── evaluate.py                     # Deterministic greedy evaluation script
 ├── record_demo.py                  # Live X11 GUI visualizer with match HUD overlay
 ├── plot_metrics.py                 # 4-panel training and evaluation telemetry dashboard
@@ -312,10 +314,20 @@ In single-agent training, the agent optimizes against a **fixed, static program*
 ```
 
 Promotion: every `--eval-freq` steps the learner plays `--eval-matches` (default 20) matches to
-`--eval-target-score` (default 7) against pool snapshots, alternating sides, with 2% epsilon on both
-sides and a step cap. Draws count as half a win. If the win rate reaches `--promotion-threshold`
-(default 65%), the learner's weights are added to the pool. Only the learner's own transitions go
-into the replay buffer.
+`--eval-target-score` (default 7) against snapshots drawn uniformly from the pool, alternating sides,
+with 2% epsilon on both sides and a step cap. Draws count as half a win. If the win rate reaches
+`--promotion-threshold` (default 65%), the learner's weights are added to the pool. Only the
+learner's own transitions go into the replay buffer.
+
+Opponent pool:
+- **Size cap** (`--pool-size`, default 50): only the newest snapshots are played against; adding one
+  beyond the cap retires the oldest (its file stays in `pool/`). Without a cap the first 10M-step run
+  collected 290 snapshots and, sampling them uniformly, spent most matches against weak early copies.
+- **Prioritized Fictitious Self-Play** (`--opponent-sampling pfsp`, default; AlphaStar): the newest
+  snapshot is played `--latest-prob` (default 20%) of the time; otherwise a snapshot is chosen with
+  weight (1 − p)², where p is the learner's win rate over its last 20 finished matches against it
+  (Beta(1,1) prior). Opponents the learner still loses to come up more often. `--opponent-sampling
+  uniform` restores classic fictitious self-play. The win-rate table is saved in checkpoints.
 
 The training reward is the 2-player game's own per-player reward, clipped: +1 for a point won,
 −1 for a point lost, and −1 when the player holding the ball fails to serve within ~2 seconds
@@ -346,6 +358,63 @@ preprocessing:
 > (it is followed by at least one NOOP), so the remap *introduced* a domain shift. It has been removed.
 > Self-play checkpoints and PvP results produced with the remap (including the committed
 > `checkpoints_selfplay/` run) should be regenerated.
+
+---
+
+## 2048 (`train_2048.py`, `play_2048.py`)
+
+A single-player puzzle (no opponent, so no self-play) solved with the same `DQNAgent`:
+
+- **Game** (`src/games/game_2048.py`): pure-NumPy 4×4 engine, standard rules (slide, merge once per
+  tile, spawn a 2 (90%) or 4 (10%) only after a move that changes the board).
+- **Environment** (`src/games/env_2048.py`): observation is a (16, 4, 4) one-hot of log2 tile values;
+  reward is log2 of the points gained by the move (0 if no merge, −0.5 for an illegal move);
+  `info["legal_mask"]` gives the legal moves.
+- **Network** (`src/model_2048.py`): parallel 1×2, 2×1 and 2×2 convolutions → 512 → 256 → 4.
+- **Action masking** (`--action-masking`, default on): illegal moves are never chosen, and the replay
+  buffer stores each next state's legal mask so the bootstrap target (max, or Double DQN argmax) only
+  considers legal moves. Without that, untrained Q-values of never-taken illegal moves leak into
+  the targets.
+
+```bash
+.venv/bin/python3 train_2048.py --total-steps 500000          # checkpoints_2048/
+.venv/bin/python3 train_2048.py --resume checkpoints_2048/latest.pt --additional-steps 500000
+.venv/bin/python3 play_2048.py --mode ai --checkpoint checkpoints_2048/best_model.pt
+.venv/bin/python3 play_2048.py --mode human                    # W/A/S/D or arrow keys
+```
+
+Evaluation uses the same fixed seeds every time, so `best_model.pt` is chosen on comparable scores.
+
+When resuming 2048 training, the checkpoint restores the exploration schedule,
+reward, action masking, and symmetry augmentation settings. Use
+`--symmetry-augment` or `--no-symmetry-augment` to override saved augmentation.
+Replay is restored from the matching sidecar.
+For legacy training checkpoints from a trusted source, use `--trust-checkpoint`
+and pass the matching replay file explicitly with `--replay-path`.
+
+Options that matter most for reaching big tiles (a 2048 tile takes ~1,000 moves):
+- `--reward {log,linear}` / `--reward-scale` (default 1 for log, 1/1024 for linear). With
+  discounting, log reward makes distant big merges almost worthless (a 2048 merge 500 moves away is
+  worth ~3% of one move's reward at γ = 0.99); linear keeps them about one move's worth.
+- `--gamma`: the planning horizon is roughly 1/(1 − γ) moves (100 at 0.99, 200 at 0.995).
+- `--eps-end`: random moves late in a game can wreck a corner strategy; keep it small.
+- `--symmetry-augment`: each sampled transition is replaced by one of its 8 rotations/reflections
+  (move and legal mask remapped, derived from the game engine), multiplying rare late-game data.
+
+`eval_2048.py` compares checkpoints on 200 held-out games (fixed seeds, separate from the training
+evals) and prints the standard error. Results so far (log reward, γ = 0.99 unless noted):
+
+| Checkpoint | Mean score | ≥ 512 | ≥ 1024 | ≥ 2048 |
+|---|---|---|---|---|
+| No symmetry, 2M steps (`A_log_g0.99`) | 4457 ± 195 | 38% | 4% | 0% |
+| No symmetry, 10M steps (`checkpoints_2048`) | 6858 ± 212 | 74% | 15% | 0% |
+| `--eps-end 0.002`, 2M | 4639 ± 270 | 40% | 10% | 0% |
+| `--symmetry-augment`, 2M (`D2_symmetry`) | 7213 ± 262 | 68% | 17% | 0% |
+| `--symmetry-augment`, best (~1.75M) | 9310 ± 274 | 86% | 32% | 0.5% |
+| `--symmetry-augment --eps-end 0.002`, 2M | 7655 ± 268 | 73% | 22% | 0% |
+
+Symmetry augmentation at 2M steps beats 10M steps without it; the non-augmented run plateaus.
+Scores swing a lot between checkpoints (the 10M run scored 4930 at 5M), so keep the best one.
 
 ---
 

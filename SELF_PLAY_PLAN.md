@@ -217,7 +217,7 @@ opponent sampler.
 | **C2** | Fixed learned opponent | PettingZoo | frozen strong DQN (the C0 champion), never changes | Fixed but *strong* opponent |
 | **C3** | Naive self-play | PettingZoo | latest learner copy, refreshed every 50k steps | Ablation: expected to cycle or forget |
 | **C4** | Fictitious self-play (FSP) | PettingZoo | pool of past snapshots: 80% uniform, 20% latest; gated promotion | **Main self-play condition** (current trainer, fixed) |
-| **C5** | Prioritized FSP (PFSP) | PettingZoo | pool, sampled ∝ (1 − win-rate vs. opponent)² | AlphaStar-style improvement |
+| **C5** | Prioritized FSP (PFSP) — ✅ implemented (`--opponent-sampling pfsp`, now the default) | PettingZoo | pool, sampled ∝ (1 − win-rate vs. opponent)² | AlphaStar-style improvement |
 
 **Core set (do first): C0, C1, C4.** Extended set: C2, C3, C5.
 

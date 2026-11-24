@@ -8,7 +8,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = [
-    "train.py", "train_selfplay.py", "evaluate.py", "tournament.py", "round_robin_tournament.py",
+    "train.py", "train_selfplay.py", "train_2048.py", "play_2048.py",
+    "evaluate.py", "tournament.py", "round_robin_tournament.py",
     "pvp_battle.py", "play_remote.py", "record_demo.py", "plot_metrics.py",
 ]
 
