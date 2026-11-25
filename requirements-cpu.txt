@@ -1,6 +1,7 @@
 # Install torch first from https://download.pytorch.org/whl/cpu (see README.md).
 torch==2.15.0+cpu
 ale-py==0.12.1
+filelock==4.2.4
 gymnasium==1.4.0
 ImageIO==2.38.2
 matplotlib==3.11.2

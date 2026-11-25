@@ -8,16 +8,17 @@ Features:
 """
 
 import os
-import sys
 import time
 import signal
 import json
 import argparse
+from contextlib import ExitStack
 import numpy as np
 
 from src.wrappers import make_atari_env
 from src.atari_replay import AtariReplayBuffer
 from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
+from src.run import checkpoint_stamp, open_run, validate_resume
 from src.training import add_training_arguments, resolve_training_config, restore_training_state
 from src.utils import (
     MetricTracker, capture_rng_state, configure_exploration, get_device, set_seed,
@@ -35,8 +36,11 @@ def parse_args():
     parser.add_argument("--eval-episodes", type=int, help="Number of checkpoint evaluation episodes (default: 5)")
     parser.add_argument("--eval-seed", type=int, help="First seed of the fixed checkpoint evaluation set (default: 1000)")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
-    parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
+    parser.add_argument("--save-dir", help="Run output directory (default for fresh runs: checkpoints)")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--resume", help="Path to a training checkpoint for the same game")
+    source.add_argument("--base-model", help="Initialize weights only, with fresh replay and optimizer")
+    parser.add_argument("--legacy-resume-env", help="Declare the known environment of an older checkpoint lacking game metadata")
     parser.add_argument("--replay-path", type=str, default=None, help="Path to replay buffer npz to resume from")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
     parser.add_argument("--early-stop-score", type=float, default=None, help="Stop early if mean evaluation score reaches this threshold (None to disable)")
@@ -83,20 +87,31 @@ def evaluate_policy(agent, env_id: str, num_episodes: int = 5, seed: int = 1_000
 
 
 def train(args):
+    with ExitStack() as resources:
+        _train(args, resources)
+
+
+def _train(args, resources):
     device = get_device()
     checkpoint_data = {}
+    resume_stamp = None
     if args.resume:
         print(f"\n--> Resuming training from checkpoint: {args.resume}")
+        resume_stamp = checkpoint_stamp(args.resume)
         checkpoint_data = read_checkpoint(args.resume, device, trusted=args.trust_checkpoint)
+        if args.env is None and not (checkpoint_data.get("config") or {}).get("env"):
+            args.env = checkpoint_data.get("environment") or args.legacy_resume_env
     lr_override = args.lr
     resolve_training_config(args, checkpoint_data, env="ALE/Pong-v5", eval_episodes=5, eval_seed=1_000)
+    if args.resume:
+        validate_resume(checkpoint_data, "atari", args.env, legacy_environment=args.legacy_resume_env)
     if args.eval_freq > 0 and (args.eval_episodes <= 0 or args.eval_seed < 0):
         raise ValueError("Evaluation requires a positive --eval-episodes and a nonnegative --eval-seed")
-    os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
 
     # Create training environment
     env = make_atari_env(args.env, clip_rewards=True, episodic_life=True)
+    resources.callback(env.close)
     num_actions = env.action_space.n
     print(f"Environment: {args.env} | Action Space: {num_actions} actions | Device: {device}")
     if args.double_dqn:
@@ -107,6 +122,7 @@ def train(args):
         capacity=args.buffer_size,
         state_shape=(4, 84, 84),
         device=device,
+        replay_context=args.env,
     )
 
     # Initialize DQN Agent
@@ -124,6 +140,8 @@ def train(args):
     start_step = 1
     episode_count = 0
     configure_exploration(agent, args, checkpoint_data)
+    if args.base_model:
+        checkpoint_data = agent.load_weights(args.base_model, trusted=args.trust_checkpoint)
 
     # Handle Resumption
     if args.resume:
@@ -158,8 +176,16 @@ def train(args):
     if start_step > target_total_steps:
         print(f"\n[INFO] Checkpoint is already at step {start_step - 1}, which already meets or exceeds target steps ({target_total_steps}).")
         print(f"Nothing to train. To train further, specify a higher --total-steps (e.g. --total-steps {start_step + 100_000}) or use --additional-steps.")
-        env.close()
         return
+
+    evaluation = {"policy": "greedy", "episodes": args.eval_episodes, "first_seed": args.eval_seed,
+                  "score": "raw_full_game", "fire_on_life_loss": "where_required"}
+    run_info, continuing = resources.enter_context(open_run(
+        args, default_dir="checkpoints", trainer="atari", environment=args.env, agent=agent,
+        evaluation=evaluation, replay_context=replay_buffer.replay_context,
+        checkpoint=checkpoint_data, resume_path=args.resume,
+        resume_stamp=resume_stamp, weights_path=args.base_model,
+    ))
 
     # Graceful shutdown handler
     interrupted = False
@@ -168,22 +194,23 @@ def train(args):
         print("\n[Interrupt] Caught signal! Saving latest progress before exit...", flush=True)
         interrupted = True
 
-    signal.signal(signal.SIGINT, sigint_handler)
+    previous_handler = signal.signal(signal.SIGINT, sigint_handler)
+    resources.callback(signal.signal, signal.SIGINT, previous_handler)
 
     log_file_path = os.path.join(args.save_dir, "training.log")
-    log_file = open(log_file_path, "a", buffering=1)
+    log_file = resources.enter_context(open(log_file_path, "a", buffering=1, encoding="utf-8"))
     log_file.write(f"Config: {json.dumps(vars(args))}\n")
 
     csv_file_path = os.path.join(args.save_dir, "training_metrics.csv")
     csv_exists = os.path.exists(csv_file_path) and os.path.getsize(csv_file_path) > 0
-    csv_file = open(csv_file_path, "a", buffering=1)
+    csv_file = resources.enter_context(open(csv_file_path, "a", buffering=1, encoding="utf-8"))
     if not csv_exists:
         csv_file.write("step,episode,avg_reward_100,avg_length_100,loss,mean_q,epsilon,fps,elapsed_seconds\n")
         csv_file.flush()
 
     eval_csv_path = os.path.join(args.save_dir, "eval_metrics.csv")
     eval_csv_exists = os.path.exists(eval_csv_path) and os.path.getsize(eval_csv_path) > 0
-    eval_csv_file = open(eval_csv_path, "a", buffering=1)
+    eval_csv_file = resources.enter_context(open(eval_csv_path, "a", buffering=1, encoding="utf-8"))
     if not eval_csv_exists:
         eval_csv_file.write("step,mean_score,std_score,min_score,max_score,mean_length,elapsed_seconds\n")
         eval_csv_file.flush()
@@ -195,7 +222,7 @@ def train(args):
     )
     best_eval_score = float("-inf")
     patience_counter = 0
-    if same_eval_set:
+    if args.resume and same_eval_set:
         best_eval_score = checkpoint_data.get("best_eval_score", best_eval_score)
         patience_counter = checkpoint_data.get("patience_counter", 0)
     elif args.resume and "best_eval_score" in checkpoint_data:
@@ -203,8 +230,6 @@ def train(args):
         print(message, flush=True)
         log_file.write(message + "\n")
 
-    # The emulator state isn't checkpointed, so a resumed run starts a fresh game
-    state, _ = env.reset(seed=args.seed + start_step - 1)
     # Per-episode (per life under EpisodicLifeEnv) and per-game accumulators.
     # tracker ep_reward/ep_length are per *game* (clipped rewards).
     game_reward = 0.0
@@ -216,6 +241,7 @@ def train(args):
 
     def save_checkpoint(step_num: int, is_latest: bool = False):
         extra = {
+            **run_info,
             "global_step": step_num,
             "episode_count": episode_count,
             "best_eval_score": best_eval_score,
@@ -232,14 +258,16 @@ def train(args):
         print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
 
     current_step = start_step
+    completed_step = start_step - 1
+    if not continuing:
+        save_checkpoint(completed_step, is_latest=True)
+    # The emulator state isn't checkpointed, so a resumed run starts a fresh game.
+    state, _ = env.reset(seed=args.seed + completed_step)
     try:
         for step in range(start_step, target_total_steps + 1):
             current_step = step
             if interrupted:
-                # Step `step` has not run yet, so the last completed step is step - 1
-                save_checkpoint(step - 1, is_latest=True)
-                print("Checkpoint saved successfully. Exiting gracefully.")
-                sys.exit(0)
+                break
 
             agent.env_steps = step
 
@@ -273,6 +301,10 @@ def train(args):
                 b_states, b_actions, b_rewards, b_next_states, b_dones = replay_buffer.sample(args.batch_size)
                 metrics = agent.update(b_states, b_actions, b_rewards, b_next_states, b_dones)
                 tracker.update(loss=metrics["loss"], mean_q=metrics["mean_q"])
+
+            completed_step = step
+            if interrupted:
+                break
 
             # Logging & Comparison CSV Writing
             if step % args.log_freq == 0 and len(replay_buffer) >= args.replay_start_size:
@@ -328,6 +360,7 @@ def train(args):
                     agent.save(
                         best_path,
                         extra_state={
+                            **run_info,
                             "global_step": step,
                             "episode_count": episode_count,
                             "best_eval_score": best_eval_score,
@@ -357,19 +390,18 @@ def train(args):
 
     except Exception as e:
         print(f"\n[CRASH DETECTED] Unhandled exception occurred at Step {current_step}: {e}", flush=True)
-        print("Saving emergency recovery checkpoint before exit...", flush=True)
-        save_checkpoint(current_step, is_latest=True)
-        log_file.close()
-        csv_file.close()
-        eval_csv_file.close()
-        env.close()
+        print("Recovery starts from the last published latest.pt.", flush=True)
         raise
 
     # Final save
-    final_step = current_step
+    final_step = completed_step
     save_checkpoint(final_step, is_latest=True)
+    if interrupted:
+        print("Checkpoint saved successfully. Exiting gracefully.", flush=True)
+        return
     final_path = os.path.join(args.save_dir, f"dqn_{args.env.replace('/', '_')}_final.pt")
     agent.save(final_path, extra_state={
+        **run_info,
         "global_step": final_step,
         "episode_count": episode_count,
         "best_eval_score": best_eval_score,
@@ -377,10 +409,6 @@ def train(args):
         "config": vars(args),
     })
     print(f"\nTraining completed! Saved final model to {final_path}", flush=True)
-    log_file.close()
-    csv_file.close()
-    eval_csv_file.close()
-    env.close()
 
 
 if __name__ == "__main__":

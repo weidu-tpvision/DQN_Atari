@@ -295,7 +295,7 @@ To train DQN on Pong (or any other Atari environment) against the built-in Atari
     --lr 0.0001 \
     --eps-decay 1000000 \
     --target-sync-freq 1000 \
-    --save-dir checkpoints
+    --save-dir runs/pong
 ```
 
 ### Key Hyperparameters:
@@ -329,7 +329,8 @@ and presses FIRE after a lost life (`FireOnLifeLossEnv`) so games like Breakout 
 Checkpoint selection reuses the same validation seeds at every evaluation. Resume
 inherits the validation set from the checkpoint. Changing the environment, seed, or
 episode count starts a fresh best-score comparison. Older checkpoints without an
-evaluation seed also start a fresh comparison. Existing CSV rows retain their historical scores.
+evaluation seed also start a fresh comparison. A changed evaluation protocol gets its
+own run directory so the old and new scores stay separate.
 
 ---
 
@@ -341,11 +342,11 @@ Single-agent training plays against the built-in Atari CPU. The two-player train
 # Train self-play from scratch:
 .venv/bin/python3 train_selfplay.py \
     --total-steps 1000000 \
-    --save-dir checkpoints_selfplay
+    --save-dir runs/selfplay
 
 # Resume self-play training:
 .venv/bin/python3 train_selfplay.py \
-    --resume checkpoints_selfplay/latest.pt \
+    --resume runs/selfplay/latest.pt \
     --additional-steps 500000
 
 # Warm-start from a single-agent model (weights only; epsilon restarts at min(--eps-start, 0.20)):
@@ -425,9 +426,9 @@ A single-player puzzle (no opponent, so no self-play) solved with the same `DQNA
   the targets.
 
 ```bash
-.venv/bin/python3 train_2048.py --total-steps 500000          # checkpoints_2048/
-.venv/bin/python3 train_2048.py --resume checkpoints_2048/latest.pt --additional-steps 500000
-.venv/bin/python3 play_2048.py --mode ai --checkpoint checkpoints_2048/best_model.pt
+.venv/bin/python3 train_2048.py --total-steps 500000 --save-dir runs/2048
+.venv/bin/python3 train_2048.py --resume runs/2048/latest.pt --additional-steps 500000
+.venv/bin/python3 play_2048.py --mode ai --checkpoint runs/2048/best_model.pt
 .venv/bin/python3 play_2048.py --mode human                    # W/A/S/D or arrow keys
 ```
 
@@ -492,10 +493,25 @@ To plot or compare multiple runs:
 
 ## Crash Resilience & Atomic Saving
 
-- **Atomic Checkpoint Publishing**: The trainer writes a versioned replay snapshot first, then publishes the model with an atomic rename. An interruption before the rename leaves the previous model and replay available.
-- **Immediate Disk Sync**: The CSV writer calls `os.fsync()` after every log interval so no telemetry is lost if the machine restarts.
-- **Exception Trap**: Unhandled exceptions trigger an emergency checkpoint save before terminating.
-- **SIGINT Trap**: Pressing `Ctrl+C` saves `latest.pt` and its associated replay snapshot when replay saving is enabled.
+- A new run publishes an initial checkpoint before training steps begin. At each save, the trainer writes a versioned replay snapshot first and publishes the model with an atomic rename.
+- After an exception, resume from the last published `latest.pt`. The checkpoint interval determines how much work may need to be repeated.
+- Pressing `Ctrl+C` lets the current training step finish and saves `latest.pt`, with replay when enabled.
+
+## Run Directories and Manifests
+
+Use an empty `--save-dir` to put a new run directly at that path. If the requested
+directory already has artifacts or an active writer, the trainer creates a
+`run-<id>` subdirectory and prints its path. Each run has a `run.json` manifest
+and its own checkpoints and CSVs. The manifest records the run ID, trainer and
+environment, parent checkpoint, and each session’s resolved config, Git
+revision and dirty status, evaluation protocol, and replay context.
+
+Resuming an existing run’s `latest.pt` appends to that run when its metrics
+stop at or before the checkpoint step and the evaluation and replay settings match.
+An older checkpoint, a legacy run, a replay override, or a change to those settings
+starts a separate run when the requested directory is occupied.
+Without `--save-dir`, resume uses the source checkpoint’s directory as the
+requested location.
 
 ---
 
@@ -506,15 +522,13 @@ Training is fully resumable:
 ```bash
 # Option A: Train until a specific total step target (e.g. 1.5M steps total)
 .venv/bin/python3 train.py \
-    --resume checkpoints/latest.pt \
-    --total-steps 1500000 \
-    --save-dir checkpoints
+    --resume runs/pong/latest.pt \
+    --total-steps 1500000
 
 # Option B: Train for an additional N steps from where the checkpoint left off
 .venv/bin/python3 train.py \
-    --resume checkpoints/latest.pt \
-    --additional-steps 500000 \
-    --save-dir checkpoints
+    --resume runs/pong/latest.pt \
+    --additional-steps 500000
 ```
 
 This restores:
@@ -539,8 +553,12 @@ All three trainers reuse saved settings such as `--gamma`, `--train-freq`,
 `--lr` and `--no-double-dqn`. Self-play also reuses saved opponent sampling,
 pool size, and promotion settings. Checkpoints without a saved setting use the
 trainer default.
-Use `--replay-path` to supply a known matching buffer for an older checkpoint
-that has no replay metadata.
+Resume requires the same game and trainer. Use `train.py --base-model CHECKPOINT`
+to transfer compatible weights with a fresh optimizer and replay. For an older
+Atari checkpoint without environment metadata, `--legacy-resume-env` declares
+its known source game. Use `--replay-path` to locate a moved matching snapshot
+or to supply the known matching buffer for a legacy checkpoint without replay
+metadata.
 
 Not restored: the emulator state (a resumed run starts a fresh game) and the ALE's internal RNG,
 so a resumed run is close to, but not bit-identical with, an uninterrupted one.

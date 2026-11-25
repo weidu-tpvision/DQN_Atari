@@ -27,10 +27,12 @@ class AtariReplayBuffer(ReplayBuffer):
         capacity: int = 100_000,
         state_shape: tuple[int, int, int] = (4, 84, 84),
         device: torch.device = torch.device("cpu"),
+        *,
+        replay_context: str | None = None,
     ):
         if capacity <= 0 or len(state_shape) != 3 or any(dimension <= 0 for dimension in state_shape):
             raise ValueError("Atari replay requires a positive capacity and a (stack, height, width) shape")
-        super().__init__(capacity, state_shape, device)
+        super().__init__(capacity, state_shape, device, replay_context=replay_context)
 
     def _init_observations(self) -> None:
         self._stack_size = self.state_shape[0]

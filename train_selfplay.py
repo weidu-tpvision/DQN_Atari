@@ -37,6 +37,7 @@ import random
 import signal
 import argparse
 from collections import deque
+from contextlib import ExitStack
 from typing import Callable, List, Tuple, Dict
 
 import numpy as np
@@ -45,6 +46,7 @@ import torch
 from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
 from src.atari_replay import AtariReplayBuffer
 from src.pong2p import TwoPlayerPong, NUM_ACTIONS, policy_action
+from src.run import checkpoint_stamp, open_run, validate_resume
 from src.training import add_training_arguments, resolve_training_config, restore_training_state
 from src.utils import (
     MetricTracker, capture_rng_state, configure_exploration, get_device, set_seed,
@@ -309,8 +311,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Self-Play DQN Training for Atari Pong")
     parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total environment interaction steps")
     parser.add_argument("--additional-steps", type=int, default=None, help="Train for an additional N steps from checkpoint")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (or directory with latest.pt) to resume self-play from")
-    parser.add_argument("--base-model", help="Warm-start from model weights and cap initial epsilon at 0.20")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--resume", help="Path to self-play checkpoint (or directory with latest.pt)")
+    source.add_argument("--base-model", help="Warm-start from model weights and cap initial epsilon at 0.20")
     parser.add_argument("--replay-path", help="Explicit replay file to use on resume")
     add_training_arguments(parser)
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving periodic checkpoints")
@@ -329,22 +332,30 @@ def parse_args():
     parser.add_argument("--opponent-sampling", choices=["pfsp", "uniform"],
                         help="pfsp: favor opponents the learner loses to; uniform: classic fictitious self-play")
     parser.add_argument("--latest-prob", type=float, help="Probability of playing the newest snapshot")
-    parser.add_argument("--save-dir", type=str, default="checkpoints_selfplay", help="Directory to save selfplay data")
+    parser.add_argument("--save-dir", help="Run output directory (default for fresh runs: checkpoints_selfplay)")
     parser.add_argument("--save-buffer", action=argparse.BooleanOptionalAction, default=True, help="Save replay buffer with checkpoints")
     add_checkpoint_trust_flag(parser)
     return parser.parse_args()
 
 
 def main():
-    args = parse_args()
+    with ExitStack() as resources:
+        train(parse_args(), resources)
+
+
+def train(args, resources):
     device = get_device()
     resume_path = args.resume
     ckpt = {}
+    resume_stamp = None
+    environment = "PettingZoo/pong_v3"
     if resume_path:
         if os.path.isdir(resume_path):
             resume_path = os.path.join(resume_path, "latest.pt")
         print(f"\n--> Resuming Self-Play training from checkpoint: {resume_path}")
+        resume_stamp = checkpoint_stamp(resume_path)
         ckpt = read_checkpoint(resume_path, device, trusted=args.trust_checkpoint)
+        validate_resume(ckpt, "selfplay", environment)
     lr_override = args.lr
     resolve_training_config(
         args, ckpt, double_dqn=True, eval_freq=25_000, eval_matches=20, eval_target_score=7,
@@ -356,17 +367,13 @@ def main():
     args.eval_anchors = list(dict.fromkeys(str(Path(path).resolve()) for path in args.eval_anchors))
     set_seed(args.seed)
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    pool_dir = os.path.join(args.save_dir, "pool")
-    os.makedirs(pool_dir, exist_ok=True)
-
     print(f"\n=======================================================")
     print(f"       ATARI PONG: SELF-PLAY DQN TRAINING ENGINE       ")
     print(f"=======================================================")
     print(f"Total Steps:   {args.total_steps:,} | Buffer: {args.buffer_size:,}")
     print(f"Double DQN:    {args.double_dqn} | Promotion Win-Rate: {args.promotion_threshold}%")
     print(f"Pool:          max {args.pool_size} | sampling {args.opponent_sampling} | latest {args.latest_prob:.0%}")
-    print(f"Save Dir:      {args.save_dir} | Device: {device}")
+    print(f"Device:        {device}")
     if args.base_model:
         print(f"Base Model:    {args.base_model} (warm-starting policy)")
     print(f"-------------------------------------------------------\n")
@@ -389,13 +396,14 @@ def main():
             sys.exit(f"Base model not found: {args.base_model}")
         # Weights only: keep a fresh optimizer and counters so the epsilon schedule starts at eps_start
         print(f"Loading initial policy weights from base model: {args.base_model}")
-        learner.load_weights(args.base_model, trusted=args.trust_checkpoint)
+        ckpt = learner.load_weights(args.base_model, trusted=args.trust_checkpoint)
 
     # Initialize Replay Buffer
     replay_buffer = AtariReplayBuffer(
         capacity=args.buffer_size,
         state_shape=(4, 84, 84),
         device=device,
+        replay_context=environment,
     )
 
     tracker = MetricTracker(window_size=100)
@@ -426,17 +434,6 @@ def main():
         print(f"[INFO] Current step ({global_step:,}) already meets or exceeds target steps ({target_total_steps:,}).")
         return
 
-    pool = SnapshotPool(
-        pool_dir, device, max_size=args.pool_size, sampling=args.opponent_sampling,
-        latest_prob=args.latest_prob, trusted=args.trust_checkpoint,
-    )
-    if resume_path:
-        pool.restore(resume_path, ckpt, global_step)
-        if not pool.snapshots:
-            print("No historical opponent snapshots found. Seeding the pool from the resumed learner.")
-    if not pool.snapshots:
-        pool.add_snapshot(learner, step=global_step)
-
     anchor_opponents = []
     if args.eval_freq > 0:
         for path in args.eval_anchors:
@@ -447,28 +444,48 @@ def main():
                     digest.update(block)
             anchor_opponents.append((path, digest.hexdigest(), opponent))
 
+    evaluation = {
+        "policy": "epsilon_greedy", "epsilon": 0.02, "matches": args.eval_matches,
+        "first_seed": args.eval_seed, "target_score": args.eval_target_score,
+        "match_step_limit": 10_000, "pool_sampling": "uniform",
+        "anchors": [{"path": path, "sha256": digest} for path, digest, _ in anchor_opponents],
+    }
+    run_info, continuing = resources.enter_context(open_run(
+        args, default_dir="checkpoints_selfplay", trainer="selfplay", environment=environment,
+        agent=learner, evaluation=evaluation, replay_context=replay_buffer.replay_context,
+        checkpoint=ckpt, resume_path=resume_path,
+        resume_stamp=resume_stamp, weights_path=args.base_model,
+    ))
+    pool = SnapshotPool(
+        os.path.join(args.save_dir, "pool"), device, max_size=args.pool_size, sampling=args.opponent_sampling,
+        latest_prob=args.latest_prob, trusted=args.trust_checkpoint,
+    )
+    if resume_path:
+        pool.restore(resume_path, ckpt, global_step)
+        if not pool.snapshots:
+            print("No historical opponent snapshots found. Seeding the pool from the resumed learner.")
+    if not pool.snapshots:
+        pool.add_snapshot(learner, step=global_step)
+
     # Logging setup
-    log_file = open(os.path.join(args.save_dir, "selfplay_training.log"), "a", buffering=1)
+    log_file = resources.enter_context(open(
+        os.path.join(args.save_dir, "selfplay_training.log"), "a", buffering=1, encoding="utf-8",
+    ))
     log_file.write(f"Config: {json.dumps(vars(args))}\n")
 
     metrics_path = os.path.join(args.save_dir, "selfplay_metrics.csv")
     csv_exists = os.path.exists(metrics_path) and os.path.getsize(metrics_path) > 0
-    csv_file = open(metrics_path, "a", buffering=1)
+    csv_file = resources.enter_context(open(metrics_path, "a", buffering=1, encoding="utf-8"))
     if not csv_exists:
         csv_file.write("step,matches_played,win_rate_vs_pool,pool_size,loss,mean_q,epsilon,fps,elapsed_seconds\n")
         csv_file.flush()
 
     step_csv_path = os.path.join(args.save_dir, "selfplay_step_metrics.csv")
     step_csv_exists = os.path.exists(step_csv_path) and os.path.getsize(step_csv_path) > 0
-    step_csv_file = open(step_csv_path, "a", buffering=1)
+    step_csv_file = resources.enter_context(open(step_csv_path, "a", buffering=1, encoding="utf-8"))
     if not step_csv_exists:
         step_csv_file.write("step,matches_played,pool_size,loss,mean_q,epsilon,fps,elapsed_seconds\n")
         step_csv_file.flush()
-
-    def close_files():
-        log_file.close()
-        csv_file.close()
-        step_csv_file.close()
 
     interrupted = False
     def sigint_handler(signum, frame):
@@ -476,13 +493,13 @@ def main():
         print("\n[Interrupt] Caught signal! Saving self-play state before exit...", flush=True)
         interrupted = True
 
-    signal.signal(signal.SIGINT, sigint_handler)
-
-    game = TwoPlayerPong()
+    previous_handler = signal.signal(signal.SIGINT, sigint_handler)
+    resources.callback(signal.signal, signal.SIGINT, previous_handler)
 
     # Checkpoint helper function
     def save_checkpoint(step_num: int, is_latest: bool = False):
         extra = {
+            **run_info,
             "global_step": step_num,
             "matches_played": matches_played,
             "pool_state": pool.state_dict(),
@@ -499,15 +516,19 @@ def main():
 
     t0 = time.time()
     session_start_step = global_step
+    if not continuing:
+        save_checkpoint(global_step, is_latest=True)
+    game = TwoPlayerPong()
+    resources.callback(game.close)
 
     try:
         while global_step < target_total_steps and not interrupted:
-            matches_played += 1
             opp_agent, opp_path = pool.sample_opponent()
             learner_is_right = (random.random() < 0.5)
 
-            s_r, s_l = game.reset(seed=args.seed + matches_played)
+            s_r, s_l = game.reset(seed=args.seed + matches_played + 1)
             match_done = False
+            match_started = False
             r_pts, l_pts = 0, 0
 
             while not match_done and global_step < target_total_steps and not interrupted:
@@ -551,9 +572,16 @@ def main():
                     update_metrics = learner.update(b_s, b_a, b_r, b_ns, b_d)
                     tracker.update(loss=update_metrics["loss"], mean_q=update_metrics["mean_q"])
 
+                if not match_started:
+                    matches_played += 1
+                    match_started = True
+
                 if match_done:
                     learner_pts, opp_pts = (r_pts, l_pts) if learner_is_right else (l_pts, r_pts)
                     pool.record_result(opp_path, 1.0 if learner_pts > opp_pts else 0.5 if learner_pts == opp_pts else 0.0)
+
+                if interrupted:
+                    break
 
                 # Periodic Console Logging
                 if global_step % args.log_freq == 0:
@@ -617,21 +645,17 @@ def main():
 
     except Exception as e:
         print(f"\n[CRASH DETECTED] Unhandled exception occurred at Step {global_step}: {e}", flush=True)
-        print("Saving emergency recovery checkpoint before exit...", flush=True)
-        save_checkpoint(global_step, is_latest=True)
-        close_files()
-        game.close()
+        print("Recovery starts from the last published latest.pt.", flush=True)
         raise
 
     save_checkpoint(global_step, is_latest=True)
-    game.close()
     if interrupted:
         print("Checkpoint saved successfully. Exiting gracefully.", flush=True)
-        close_files()
-        sys.exit(0)
+        return
 
     final_path = os.path.join(args.save_dir, "selfplay_final.pt")
     learner.save(final_path, {
+        **run_info,
         "global_step": global_step,
         "matches_played": matches_played,
         "pool_snapshots": pool.snapshot_names,
@@ -639,7 +663,6 @@ def main():
         "config": vars(args),
     })
     print(f"\n[DONE] Self-Play training concluded at step {global_step:,}. Final model saved to {final_path}")
-    close_files()
 
 
 if __name__ == "__main__":

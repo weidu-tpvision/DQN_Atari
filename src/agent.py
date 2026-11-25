@@ -273,9 +273,10 @@ class DQNAgent:
         self.num_updates = checkpoint.get("num_updates", checkpoint.get("total_steps", 0))
         self.env_steps = checkpoint.get("env_steps", checkpoint.get("global_step", 0))
 
-    def load_weights(self, path: str, *, trusted: bool = False) -> None:
+    def load_weights(self, path: str, *, trusted: bool = False) -> dict:
         """Load only network weights (fresh optimizer and counters), e.g. to warm-start or to play."""
         checkpoint = read_checkpoint(path, self.device, trusted=trusted)
         state_dict = checkpoint["online_net"] if "online_net" in checkpoint else checkpoint
         self.online_net.load_state_dict(state_dict)
         self.sync_target_network()
+        return checkpoint

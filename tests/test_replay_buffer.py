@@ -174,3 +174,20 @@ def test_legacy_checkpoint_can_restore_fixed_replay_filename(tmp_path):
     checkpoint = {"replay": {"file": replay_path.name, "id": "legacy"}}
     assert restored.restore_for_checkpoint(str(tmp_path / "latest.pt"), checkpoint, None)
     assert len(restored) == 2
+
+
+def test_explicit_replay_path_checks_game_and_checkpoint_pair(tmp_path):
+    shape = (1, 2, 2)
+    source = ReplayBuffer(capacity=2, state_shape=shape, replay_context="ALE/Pong-v5")
+    path = str(tmp_path / "moved_replay.npz")
+    source.save(path, checkpoint_id="pong")
+    filename = str(tmp_path / "latest.pt")
+
+    wrong_game = ReplayBuffer(capacity=2, state_shape=shape, replay_context="ALE/SpaceInvaders-v5")
+    with pytest.raises(ValueError, match="Replay context"):
+        wrong_game.restore_for_checkpoint(filename, {}, path)
+
+    matching_game = ReplayBuffer(capacity=2, state_shape=shape, replay_context="ALE/Pong-v5")
+    with pytest.raises(ValueError, match="does not match the checkpoint"):
+        matching_game.restore_for_checkpoint(filename, {"replay": {"id": "other"}}, path)
+    assert matching_game.restore_for_checkpoint(filename, {"replay": {"id": "pong"}}, path)

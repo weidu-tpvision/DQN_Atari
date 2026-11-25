@@ -27,6 +27,8 @@ class ReplayBuffer:
         state_shape: Tuple[int, ...] = (4, 84, 84),
         device: torch.device = torch.device("cpu"),
         action_mask_dim: Optional[int] = None,
+        *,
+        replay_context: str | None = None,
     ):
         """Initialize the replay buffer.
 
@@ -36,12 +38,14 @@ class ReplayBuffer:
             device: PyTorch device to move sampled batches to.
             action_mask_dim: If set, also store the legal-action mask of each next state
                 (for games with illegal moves); `sample()` then returns it as a 6th element.
+            replay_context: Identity of the game and reward semantics for saved replay.
         """
         self.capacity = capacity
         self.device = device
         self.ptr = 0
         self.size = 0
         self.state_shape = state_shape
+        self.replay_context = replay_context
 
         self._init_observations()
         self.actions = np.zeros(capacity, dtype=np.int64)
@@ -105,6 +109,8 @@ class ReplayBuffer:
         """Save replay buffer state and arrays to compressed npz file atomically."""
         tmp_path = path + ".tmp.npz"
         arrays = self._snapshot_arrays()
+        if self.replay_context is not None:
+            arrays["replay_context"] = self.replay_context
         try:
             np.savez_compressed(tmp_path, checkpoint_id=checkpoint_id, ptr=self.ptr, size=self.size, **arrays)
             os.replace(tmp_path, path)
@@ -125,6 +131,12 @@ class ReplayBuffer:
                 "checkpoint_id" not in data or data["checkpoint_id"].item() != checkpoint_id
             ):
                 raise ValueError(f"Replay file {path} does not match the checkpoint that references it.")
+            if self.replay_context is not None and "replay_context" in data.files:
+                saved_context = data["replay_context"].item()
+                if saved_context != self.replay_context:
+                    raise ValueError(f"Replay context {saved_context!r} does not match {self.replay_context!r} for {path}.")
+                if self.next_masks is not None and "next_masks" not in data.files:
+                    raise ValueError(f"Replay file {path} is missing saved action masks.")
             self._load_arrays(data)
 
     def _load_arrays(self, data) -> None:
@@ -187,11 +199,11 @@ class ReplayBuffer:
             pass
 
     def restore_for_checkpoint(self, checkpoint_path: str, checkpoint: dict, override: str | None) -> bool:
+        replay = checkpoint.get("replay")
         if override is not None:
-            self.load(override)
+            self.load(override, checkpoint_id=replay["id"] if replay is not None else None)
             return True
 
-        replay = checkpoint.get("replay")
         if replay is None:
             return False
 

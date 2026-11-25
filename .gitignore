@@ -27,6 +27,9 @@ checkpoints*/*.bak
 !checkpoints*/**/*.csv
 !checkpoints*/*.png
 !checkpoints*/**/*.png
+checkpoints*/run-*/
+runs/
+.run.lock
 
 # Media files & recordings
 *.mp4

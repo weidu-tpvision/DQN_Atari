@@ -7,11 +7,11 @@ The current trainer learns against frozen copies of its own policy in PettingZoo
 | Area | Current behavior |
 | --- | --- |
 | **Game and observations** | [`TwoPlayerPong`](../src/pong2p.py#L51) runs PettingZoo Pong in ALE two-player mode. It uses 1–30 reset no-ops, four-frame action repeat, two-frame max pooling, and four grayscale frames at `84 × 84`. The left view is mirrored so the policy sees its own paddle on the right. |
-| **Training** | [`train_selfplay.py`](../train_selfplay.py#L504) chooses one opponent and a random learner side per match. The learner uses its ε schedule and the opponent uses a greedy policy with ε = 0.05. Replay stores only the learner’s transitions. Double DQN is on by default. |
+| **Training** | [`train_selfplay.py`](../train_selfplay.py#L522-L578) chooses one opponent and a random learner side per match. The learner uses its ε schedule and the opponent uses a greedy policy with ε = 0.05. Replay stores only the learner’s transitions. Double DQN is on by default. |
 | **Rewards and terminals** | The learner receives clipped raw game rewards, including a penalty if it holds the ball and fails to serve. The penalty changes the reward without awarding a point. A scored point or a true game ending cuts off bootstrapping. A time-limit cutoff alone still bootstraps. |
-| **Opponent sampling** | The active [snapshot pool](../train_selfplay.py#L69) defaults to 50 weights-only snapshots. Training picks the latest with probability 0.2. Otherwise it samples uniformly or uses the default PFSP weights `(1 − p)²`, where `p` is the smoothed learner win rate over up to 20 recent matches against that opponent. Retired snapshots stay on disk. |
-| **Promotion** | Every 25,000 steps by default, [evaluation](../train_selfplay.py#L205) plays 20 matches targeting seven points, alternating sides and sampling opponents uniformly from the active pool. Both policies use ε = 0.02. The match cap is 10,000 agent steps, and a draw counts as half a win. A score of 65% or higher against the active pool promotes a new snapshot. |
-| **Resume and warm-start** | Resume restores learner weights and optimizer state, step counters, the saved ε schedule, and the active snapshot list and match records. Full checkpoints can also restore matching replay and saved RNG state. Keep the referenced replay snapshot and adjacent `pool/` with the checkpoint. Warm-start loads weights, starts fresh optimizer and counters, and caps the starting ε at 0.20. [Resume code](../train_selfplay.py#L406) · [Checkpoint guide](../README.md#resuming-training) |
+| **Opponent sampling** | The active [snapshot pool](../train_selfplay.py#L71) defaults to 50 weights-only snapshots. Training picks the latest with probability 0.2. Otherwise it samples uniformly or uses the default PFSP weights `(1 − p)²`, where `p` is the smoothed learner win rate over up to 20 recent matches against that opponent. Retired snapshots stay on disk. |
+| **Promotion** | Every 25,000 steps by default, [evaluation](../train_selfplay.py#L207) plays 20 matches targeting seven points, alternating sides and sampling opponents uniformly from the active pool. Both policies use ε = 0.02. The match cap is 10,000 agent steps, and a draw counts as half a win. A score of 65% or higher against the active pool promotes a new snapshot. |
+| **Resume and warm-start** | Resume restores learner weights and optimizer state, step counters, the saved ε schedule, and the active snapshot list and match records. Full checkpoints can also restore matching replay and saved RNG state. Keep the referenced replay snapshot and adjacent `pool/` with the checkpoint. Warm-start loads weights, starts fresh optimizer and counters, and caps the starting ε at 0.20. [Resume code](../train_selfplay.py#L413-L424) · [Checkpoint guide](../README.md#resuming-training) |
 
 ## Fixed-opponent evaluation
 
@@ -25,7 +25,7 @@ and evaluation actions use randomness independent of training.
 the evaluation settings, and the win rate and point totals. Compare rows with the same
 file hash and evaluation settings. The active pool still determines promotion. On
 resume, reuse the same checkpoint files, supply replacement paths, or clear the list
-with `--no-eval-anchors`. [Fixed-opponent evaluation code](../train_selfplay.py#L282)
+with `--no-eval-anchors`. [Fixed-opponent evaluation code](../train_selfplay.py#L284)
 
 ## Comparing with the built-in CPU
 

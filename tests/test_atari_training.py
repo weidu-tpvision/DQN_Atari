@@ -1,9 +1,12 @@
 import argparse
+import csv
+import json
 import sys
 
 import numpy as np
 import pytest
 import torch
+from filelock import FileLock
 from gymnasium.spaces import Discrete
 
 import evaluate
@@ -163,3 +166,122 @@ def test_standalone_atari_evaluation_starts_at_held_out_seed(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["evaluate.py", "--checkpoint", "unused.pt", "--episodes", "2", "--epsilon", "1"])
     evaluate.evaluate(evaluate.parse_args())
     assert env.reset_seeds == [50_000, 50_001]
+
+
+@pytest.fixture
+def run_atari(monkeypatch):
+    monkeypatch.setattr(train, "make_atari_env", lambda *args, **kwargs: ShortAtariEnv())
+    monkeypatch.setattr(train, "get_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(train.signal, "signal", lambda *args: None)
+
+    def run(directory, *options):
+        monkeypatch.setattr(sys, "argv", [
+            "train.py", "--save-dir", str(directory), "--buffer-size", "8", "--replay-start-size", "1",
+            "--batch-size", "2", "--train-freq", "1", "--eval-freq", "0", "--log-freq", "1",
+            "--save-freq", "1", "--total-steps", "3", *options,
+        ])
+        train.train(train.parse_args())
+
+    return run
+
+
+@pytest.mark.parametrize("failure", ["env", "replay", "optimizer"])
+def test_mid_step_failure_preserves_last_complete_checkpoint(tmp_path, monkeypatch, run_atari, failure):
+    cls, method = {
+        "env": (ShortAtariEnv, "step"),
+        "replay": (train.AtariReplayBuffer, "push"),
+        "optimizer": (train.DQNAgent, "update"),
+    }[failure]
+    operation = getattr(cls, method)
+    calls = 0
+
+    def fail_on_second_call(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2 and failure == "env":
+            raise RuntimeError("injected failure before environment step")
+        result = operation(*args, **kwargs)
+        if calls == 2:
+            raise RuntimeError("injected failure after a mutation")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cls, method, fail_on_second_call)
+        with pytest.raises(RuntimeError, match="injected failure"):
+            run_atari(tmp_path)
+
+    latest = tmp_path / "latest.pt"
+    clean = torch.load(latest, weights_only=True)
+    assert clean["global_step"] == clean["env_steps"] == clean["num_updates"] == 1
+    with np.load(tmp_path / clean["replay"]["file"], allow_pickle=False) as replay:
+        assert int(replay["size"]) == 1
+
+    run_atari(tmp_path, "--resume", str(latest))
+    resumed = torch.load(latest, weights_only=True)
+    assert resumed["global_step"] == resumed["env_steps"] == resumed["num_updates"] == 3
+    assert resumed["run_id"] == clean["run_id"]
+
+
+def test_cross_game_resume_is_rejected_but_weights_can_be_reused(tmp_path, run_atari):
+    source = tmp_path / "pong"
+    run_atari(source)
+    latest = source / "latest.pt"
+    original = torch.load(latest, weights_only=True)
+    output = tmp_path / "invaders"
+    with pytest.raises(ValueError, match="Cannot resume ALE/Pong-v5 training as ALE/SpaceInvaders-v5"):
+        run_atari(output, "--env", "ALE/SpaceInvaders-v5", "--resume", str(latest), "--additional-steps", "2")
+    assert not output.exists()
+
+    run_atari(output, "--env", "ALE/SpaceInvaders-v5", "--base-model", str(latest), "--total-steps", "1")
+    transferred = torch.load(output / "latest.pt", weights_only=True)
+    assert transferred["env_steps"] == transferred["num_updates"] == 1
+    assert transferred["environment"] == "ALE/SpaceInvaders-v5"
+    with np.load(output / transferred["replay"]["file"], allow_pickle=False) as replay:
+        assert int(replay["size"]) == 1 and str(replay["replay_context"]) == "ALE/SpaceInvaders-v5"
+    manifest = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    assert manifest["parent_checkpoint"]["kind"] == "weights"
+    assert manifest["parent_checkpoint"]["run_id"] == original["run_id"]
+
+
+def test_atari_run_manifest_separates_restarts_and_older_checkpoints(tmp_path, run_atari):
+    source = tmp_path / "run"
+    run_atari(source)
+    latest = source / "latest.pt"
+    original = torch.load(latest, weights_only=True)
+    run_atari(source, "--resume", str(latest), "--additional-steps", "1")
+    manifest = json.loads((source / "run.json").read_text(encoding="utf-8"))
+    assert manifest["run_id"] == original["run_id"]
+    assert [session["start_step"] for session in manifest["sessions"]] == [0, 3]
+    assert "revision" in manifest["sessions"][0]["git"]
+    assert manifest["sessions"][0]["config"]["eps_start"] == 1.0
+    assert manifest["sessions"][0]["evaluation"]["first_seed"] == 1_000
+
+    with (source / "training_metrics.csv").open(encoding="utf-8", newline="") as metrics:
+        original_curve = list(csv.DictReader(metrics))
+    assert [int(row["step"]) for row in original_curve] == [1, 2, 3, 4]
+
+    run_atari(source, "--total-steps", "1")
+    older = source / "dqn_ALE_Pong-v5_step_2.pt"
+    run_atari(source, "--resume", str(older), "--additional-steps", "1")
+    forks = [json.loads(path.read_text(encoding="utf-8")) for path in source.glob("run-*/run.json")]
+    assert len(forks) == 2
+    assert len({manifest["run_id"], *(fork["run_id"] for fork in forks)}) == 3
+    assert sorted(fork["sessions"][0]["start_step"] for fork in forks) == [0, 2]
+    fork = next(fork for fork in forks if fork["parent_checkpoint"])
+    assert fork["parent_checkpoint"]["path"] == str(older)
+    assert fork["parent_checkpoint"]["run_id"] == manifest["run_id"]
+    with (source / "training_metrics.csv").open(encoding="utf-8", newline="") as metrics:
+        assert list(csv.DictReader(metrics)) == original_curve
+
+
+def test_atari_run_forks_when_directory_has_a_writer_or_newer_metrics(tmp_path, run_atari):
+    with FileLock(str(tmp_path / ".run.lock")):
+        run_atari(tmp_path, "--total-steps", "1")
+    claimed_run, = tmp_path.glob("run-*")
+    latest = claimed_run / "latest.pt"
+    with (claimed_run / "training_metrics.csv").open("a", encoding="utf-8") as metrics:
+        metrics.write("2,0,0,0,0,0,1,1,1\n")
+    run_atari(claimed_run, "--resume", str(latest), "--additional-steps", "1")
+    fork, = claimed_run.glob("run-*")
+    assert torch.load(fork / "latest.pt", weights_only=True)["env_steps"] == 2
+    assert torch.load(latest, weights_only=True)["env_steps"] == 1

@@ -10,13 +10,13 @@ Features:
 """
 
 import os
-import sys
 import json
 import time
 import signal
 import argparse
 from typing import Dict, Any
 from collections import deque
+from contextlib import ExitStack
 
 import numpy as np
 
@@ -25,6 +25,7 @@ from src.games.symmetry_2048 import augment_batch
 from src.model_2048 import DQN2048
 from src.replay_buffer import ReplayBuffer
 from src.agent import DQNAgent, add_checkpoint_trust_flag, read_checkpoint
+from src.run import checkpoint_stamp, open_run, validate_resume
 from src.training import add_training_arguments, resolve_training_config, restore_training_state
 from src.utils import (
     MetricTracker, capture_rng_state, configure_exploration, get_device, set_seed,
@@ -38,9 +39,9 @@ def parse_args():
     add_training_arguments(parser)
     parser.add_argument("--save-freq", type=int, default=50_000, help="Step interval for saving checkpoints")
     parser.add_argument("--eval-freq", type=int, default=10_000, help="Step interval for greedy policy evaluation")
-    parser.add_argument("--eval-episodes", type=int, default=10, help="Number of greedy evaluation episodes (same fixed seeds every time)")
+    parser.add_argument("--eval-episodes", type=int, help="Number of greedy evaluation episodes (default: 10)")
     parser.add_argument("--log-freq", type=int, default=1_000, help="Step interval for console progress")
-    parser.add_argument("--save-dir", type=str, default="checkpoints_2048", help="Directory to save checkpoints")
+    parser.add_argument("--save-dir", help="Run output directory (default for fresh runs: checkpoints_2048)")
     parser.add_argument("--action-masking", action=argparse.BooleanOptionalAction, default=None, help="Mask illegal moves")
     parser.add_argument("--reward", choices=["log", "linear"],
                         help="Per-move reward: log2(points gained) or the points gained (game score increment)")
@@ -98,16 +99,26 @@ def evaluate_policy(agent: DQNAgent, num_episodes: int = 10, action_masking: boo
 
 
 def train(args):
+    with ExitStack() as resources:
+        _train(args, resources)
+
+
+def _train(args, resources):
     device = get_device()
     ckpt = {}
+    resume_stamp = None
     if args.resume:
         print(f"\n--> Resuming training from checkpoint: {args.resume}")
+        resume_stamp = checkpoint_stamp(args.resume)
         ckpt = read_checkpoint(args.resume, device, trusted=args.trust_checkpoint)
+        validate_resume(ckpt, "2048", "2048")
     lr_override = args.lr
     resolve_training_config(
         args, ckpt, replay_start_size=5_000, batch_size=64, lr=2e-4, train_freq=2, double_dqn=True,
+        eval_episodes=10,
     )
-    os.makedirs(args.save_dir, exist_ok=True)
+    if args.eval_freq > 0 and args.eval_episodes <= 0:
+        raise ValueError("Evaluation requires a positive --eval-episodes")
     set_seed(args.seed)
 
     # Initialize DQN Agent with custom DQN2048 architecture
@@ -148,6 +159,8 @@ def train(args):
         args.action_masking = saved_masking
     if args.symmetry_augment is None:
         args.symmetry_augment = saved_config.get("symmetry_augment", False)
+    if args.action_masking != saved_masking or args.eval_episodes != saved_config.get("eval_episodes", 10):
+        best_eval_score = -float("inf")
 
     if args.additional_steps is not None:
         target_total_steps = (start_step - 1) + args.additional_steps
@@ -165,10 +178,11 @@ def train(args):
     print(f"Batch Size:     {args.batch_size} | LR: {args.lr} | Gamma: {args.gamma}")
     print(f"Double DQN:     {args.double_dqn} | Action Masking: {args.action_masking}")
     print(f"Reward:         {args.reward} x {args.reward_scale:g} | Symmetry Augment: {args.symmetry_augment}")
-    print(f"Save Directory: {args.save_dir} | Device: {device}")
+    print(f"Device:         {device}")
     print(f"-------------------------------------------------------\n")
 
     env = Env2048(reward=args.reward, reward_scale=args.reward_scale)
+    resources.callback(env.close)
 
     # Experience replay buffer stores (16, 4, 4) uint8 binary one-hot tensors
     replay_buffer = ReplayBuffer(
@@ -176,6 +190,7 @@ def train(args):
         state_shape=(16, 4, 4),
         device=device,
         action_mask_dim=4 if args.action_masking else None,
+        replay_context=f"2048:{args.reward}:{float(args.reward_scale)}",
     )
 
     if args.resume:
@@ -191,21 +206,29 @@ def train(args):
         else:
             print("No associated replay buffer. Collecting fresh transitions.")
 
+    evaluation = {"policy": "greedy", "episodes": args.eval_episodes, "first_seed": 1_000,
+                  "score": "raw_game_score", "action_masking": args.action_masking}
+    run_info, continuing = resources.enter_context(open_run(
+        args, default_dir="checkpoints_2048", trainer="2048", environment="2048", agent=agent,
+        evaluation=evaluation, replay_context=replay_buffer.replay_context,
+        checkpoint=ckpt, resume_path=args.resume, resume_stamp=resume_stamp,
+    ))
+
     # Logging setup
     log_path = os.path.join(args.save_dir, "training.log")
-    log_file = open(log_path, "a", buffering=1)
+    log_file = resources.enter_context(open(log_path, "a", buffering=1, encoding="utf-8"))
     log_file.write(f"Config: {json.dumps(vars(args))}\n")
 
     csv_path = os.path.join(args.save_dir, "training_metrics.csv")
     csv_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
-    csv_file = open(csv_path, "a", buffering=1)
+    csv_file = resources.enter_context(open(csv_path, "a", buffering=1, encoding="utf-8"))
     if not csv_exists:
         csv_file.write("step,episode,avg_score_100,avg_moves_100,max_tile_100,loss,mean_q,epsilon,fps,elapsed_seconds\n")
         csv_file.flush()
 
     eval_csv_path = os.path.join(args.save_dir, "eval_metrics.csv")
     eval_csv_exists = os.path.exists(eval_csv_path) and os.path.getsize(eval_csv_path) > 0
-    eval_csv_file = open(eval_csv_path, "a", buffering=1)
+    eval_csv_file = resources.enter_context(open(eval_csv_path, "a", buffering=1, encoding="utf-8"))
     if not eval_csv_exists:
         eval_csv_file.write("step,mean_score,max_score,mean_moves,highest_tile,pct_256,pct_512,pct_1024,pct_2048,elapsed_seconds\n")
         eval_csv_file.flush()
@@ -216,10 +239,12 @@ def train(args):
         print("\n[Interrupt] Caught signal! Saving 2048 checkpoint before exit...", flush=True)
         interrupted = True
 
-    signal.signal(signal.SIGINT, sigint_handler)
+    previous_handler = signal.signal(signal.SIGINT, sigint_handler)
+    resources.callback(signal.signal, signal.SIGINT, previous_handler)
 
     def save_checkpoint(step_num: int, is_latest: bool = False):
         extra = {
+            **run_info,
             "global_step": step_num,
             "episode_count": episode_count,
             "best_eval_score": best_eval_score,
@@ -233,8 +258,11 @@ def train(args):
         agent.save(ckpt_path, extra_state=extra, replay_buffer=replay_buffer if save_replay else None)
         print(f"--> Saved checkpoint to {ckpt_path}", flush=True)
 
-    # The game in progress isn't checkpointed, so a resumed run starts a fresh (differently seeded) game
-    state, info = env.reset(seed=args.seed + start_step - 1)
+    completed_step = start_step - 1
+    if not continuing:
+        save_checkpoint(completed_step, is_latest=True)
+    # The game in progress isn't checkpointed, so a resumed run starts a fresh game.
+    state, info = env.reset(seed=args.seed + completed_step)
     recent_scores = deque(maxlen=100)
     recent_moves = deque(maxlen=100)
     recent_max_tiles = deque(maxlen=100)
@@ -246,10 +274,7 @@ def train(args):
             current_step = step
 
             if interrupted:
-                # Step `step` has not run yet, so the last completed step is step - 1
-                save_checkpoint(step - 1, is_latest=True)
-                print("Checkpoint saved successfully. Exiting gracefully.", flush=True)
-                sys.exit(0)
+                break
 
             agent.env_steps = step
 
@@ -287,6 +312,10 @@ def train(args):
                     b_s, b_a, b_ns, b_m = augment_batch(b_s, b_a, b_ns, b_m)
                 metrics = agent.update(b_s, b_a, b_r, b_ns, b_d, next_masks=b_m)
                 tracker.update(loss=metrics["loss"], mean_q=metrics["mean_q"])
+
+            completed_step = step
+            if interrupted:
+                break
 
             # Console logging
             if step % args.log_freq == 0 and len(replay_buffer) >= args.replay_start_size:
@@ -340,7 +369,7 @@ def train(args):
                 if res["mean_score"] > best_eval_score:
                     best_eval_score = res["mean_score"]
                     best_path = os.path.join(args.save_dir, "best_model.pt")
-                    agent.save(best_path, {"global_step": step, "best_eval_score": best_eval_score, "config": vars(args)})
+                    agent.save(best_path, {**run_info, "global_step": step, "best_eval_score": best_eval_score, "config": vars(args)})
                     print(f"--> [NEW BEST MODEL] High score: {best_eval_score:.0f} saved to {best_path}!\n", flush=True)
 
             # Checkpointing
@@ -350,22 +379,17 @@ def train(args):
 
     except Exception as e:
         print(f"\n[CRASH DETECTED] Unhandled exception at step {current_step}: {e}", flush=True)
-        save_checkpoint(current_step, is_latest=True)
-        log_file.close()
-        csv_file.close()
-        eval_csv_file.close()
-        env.close()
+        print("Recovery starts from the last published latest.pt.", flush=True)
         raise
 
     # Final save
-    save_checkpoint(current_step, is_latest=True)
+    save_checkpoint(completed_step, is_latest=True)
+    if interrupted:
+        print("Checkpoint saved successfully. Exiting gracefully.", flush=True)
+        return
     final_path = os.path.join(args.save_dir, "dqn_2048_final.pt")
-    agent.save(final_path, {"global_step": current_step, "best_eval_score": best_eval_score, "config": vars(args)})
-    print(f"\n[DONE] 2048 training complete at step {current_step:,}. Final model saved to {final_path}")
-    log_file.close()
-    csv_file.close()
-    eval_csv_file.close()
-    env.close()
+    agent.save(final_path, {**run_info, "global_step": completed_step, "best_eval_score": best_eval_score, "config": vars(args)})
+    print(f"\n[DONE] 2048 training complete at step {completed_step:,}. Final model saved to {final_path}")
 
 
 if __name__ == "__main__":
